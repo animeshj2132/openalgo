@@ -40,6 +40,7 @@ from .orderbook import api as orderbook_ns
 from .orderstatus import api as orderstatus_ns
 from .ping import api as ping_ns
 from .place_order import api as place_order_ns
+from .placeorder_broker_token import api as place_order_broker_token_ns
 from .place_smart_order import api as place_smart_order_ns
 from .pnl_symbols import api as pnl_symbols_ns
 from .positionbook import api as positionbook_ns
@@ -54,6 +55,7 @@ from .tradebook import api as tradebook_ns
 
 # Add namespaces
 api.add_namespace(place_order_ns, path="/placeorder")
+api.add_namespace(place_order_broker_token_ns, path="/placeorderext")
 api.add_namespace(place_smart_order_ns, path="/placesmartorder")
 api.add_namespace(modify_order_ns, path="/modifyorder")
 api.add_namespace(cancel_order_ns, path="/cancelorder")
