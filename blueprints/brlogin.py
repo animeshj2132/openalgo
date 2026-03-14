@@ -18,7 +18,7 @@ from utils.config import (
     get_login_rate_limit_min,
 )
 from utils.logging import get_logger
-from utils.platform_state import parse_platform_state
+from utils.platform_state import parse_platform_ctx, parse_platform_state
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -44,12 +44,19 @@ def broker_callback(broker, para=None):
     logger.info(f"Session has user key: {'user' in session}")
 
     # ── Platform OAuth fast-path (ChartMate → broker → back to ChartMate) ─────
-    # When ChartMate initiates broker OAuth it embeds a signed state containing
-    # the target OpenAlgo username and the ChartMate return URL.
-    # We handle the full token exchange here without touching the OpenAlgo session,
-    # then redirect back to ChartMate so the user never sees OpenAlgo.
-    _state_raw = request.args.get("state", "")
-    _platform_username, _platform_return_url = parse_platform_state(_state_raw)
+    # The user's browser visited /api/v1/platform/zerodha/initiate which set the
+    # _oa_ctx cookie on this domain before redirecting to Zerodha.  When Zerodha
+    # bounces the browser back here we read that cookie — no OpenAlgo session needed.
+    # (We also keep a state-param fallback, but Zerodha doesn't echo state back.)
+    _platform_username, _platform_return_url = None, None
+
+    _ctx_cookie = request.cookies.get("_oa_ctx", "")
+    if _ctx_cookie:
+        _platform_username, _platform_return_url = parse_platform_ctx(_ctx_cookie)
+
+    if not _platform_username:
+        _state_raw = request.args.get("state", "")
+        _platform_username, _platform_return_url = parse_platform_state(_state_raw)
 
     if _platform_username and _platform_return_url and broker == "zerodha":
         logger.info(f"Platform OAuth callback for zerodha, username={_platform_username}")
@@ -80,7 +87,9 @@ def broker_callback(broker, para=None):
             f"{_platform_return_url}"
             f"?broker=zerodha&broker_token={_url_quote(full_token)}&status=success"
         )
-        return redirect(success_url)
+        resp = make_response(redirect(success_url))
+        resp.delete_cookie("_oa_ctx")   # clean up platform context cookie
+        return resp
     # ── End platform OAuth fast-path ──────────────────────────────────────────
 
     # Special handling for Compositedge - it comes from external OAuth and might lose session

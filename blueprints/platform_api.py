@@ -18,9 +18,9 @@ import os
 import secrets
 import uuid
 
-from flask import Blueprint, jsonify, redirect, request
+from flask import Blueprint, jsonify, make_response, redirect, request
 
-from utils.platform_state import sign_platform_state
+from utils.platform_state import sign_platform_ctx, sign_platform_state
 
 from database.auth_db import get_api_key_for_tradingview, upsert_api_key, upsert_auth
 from database.strategy_db import (
@@ -232,22 +232,27 @@ def delete_platform_strategy(strategy_id: int):
     return jsonify({"error": "Strategy not found"}), 404
 
 
-# ── Zerodha Platform Login URL ─────────────────────────────────────────────────
+# ── Zerodha Platform OAuth ─────────────────────────────────────────────────────
+#
+# Problem: Zerodha does NOT pass the `state` param back in its OAuth callback,
+# so we cannot use URL state to identify the platform user.
+#
+# Solution: Cookie-based context.
+#   1. ChartMate calls GET /api/v1/platform/zerodha/login-url (X-Platform-Key required).
+#      → Returns an /initiate URL (NOT the direct Kite URL).
+#   2. ChartMate redirects the user's browser to that /initiate URL.
+#   3. /initiate verifies the signed context, sets a short-lived cookie on this domain,
+#      then immediately redirects the browser to the real Kite Connect login URL.
+#   4. Zerodha redirects back to /zerodha/callback?request_token=xxx.
+#   5. brlogin.py reads the cookie, exchanges the token, stores the session for the user,
+#      redirects the browser to ChartMate — user never sees OpenAlgo UI.
 
 @platform_api_bp.route("/zerodha/login-url", methods=["GET"])
 def platform_zerodha_login_url():
     """
-    Generate a Zerodha Kite Connect login URL that returns the user back to
-    ChartMate (not OpenAlgo's own dashboard).
-
-    Query params:
-      username    — The OpenAlgo username to associate the token with after callback.
-      return_url  — Full URL of ChartMate's /broker-callback page.
-
-    The generated URL embeds a signed state parameter. OpenAlgo's /zerodha/callback
-    detects this state, exchanges the request_token → access_token, stores it for
-    <username> in OpenAlgo, then redirects to <return_url>?broker=zerodha&broker_token=...
-    — the user never sees any OpenAlgo UI.
+    Protected: requires X-Platform-Key.
+    Returns an /initiate URL (not the direct Kite URL) so the browser first visits
+    OpenAlgo to set a cookie, then gets forwarded to Zerodha.
     """
     if not _authorized(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -264,10 +269,45 @@ def platform_zerodha_login_url():
     if not broker_api_key:
         return jsonify({"error": "BROKER_API_KEY not configured on OpenAlgo server"}), 503
 
-    state = sign_platform_state(username, return_url)
-    login_url = (
-        f"https://kite.zerodha.com/connect/login"
-        f"?v=3&api_key={broker_api_key}&state={state}"
+    ctx = sign_platform_ctx(username, return_url)
+    # Build the initiate URL using the current server's host
+    host = request.host_url.rstrip("/")
+    initiate_url = f"{host}/api/v1/platform/zerodha/initiate?ctx={ctx}"
+
+    logger.info(f"Platform zerodha initiate URL generated for username={username}")
+    return jsonify({"url": initiate_url}), 200
+
+
+@platform_api_bp.route("/zerodha/initiate", methods=["GET"])
+def platform_zerodha_initiate():
+    """
+    Public (browser-accessible, no API key). Called by the user's browser.
+    Verifies the signed context, sets the _oa_ctx cookie, then redirects to Zerodha.
+    """
+    from utils.platform_state import parse_platform_ctx
+
+    ctx = (request.args.get("ctx") or "").strip()
+    username, return_url = parse_platform_ctx(ctx)
+
+    if not username or not return_url:
+        logger.warning("platform_zerodha_initiate: invalid or expired ctx")
+        return "Invalid or expired link. Please return to ChartMate and try again.", 400
+
+    broker_api_key = os.getenv("BROKER_API_KEY", "").strip()
+    if not broker_api_key:
+        return "Broker not configured. Contact support.", 503
+
+    kite_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={broker_api_key}"
+    logger.info(f"platform_zerodha_initiate: setting cookie for {username}, redirecting to Kite")
+
+    response = make_response(redirect(kite_url))
+    # Cookie lives for 10 min (matches _CTX_TTL in platform_state.py).
+    # httponly so JS can't read it; samesite=Lax so it's sent on Zerodha's top-level redirect back.
+    response.set_cookie(
+        "_oa_ctx", ctx,
+        max_age=600,
+        httponly=True,
+        samesite="Lax",
+        secure=request.is_secure,
     )
-    logger.info(f"Platform zerodha login URL generated for username={username}")
-    return jsonify({"url": login_url}), 200
+    return response
