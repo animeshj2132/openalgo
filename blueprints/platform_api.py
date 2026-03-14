@@ -5,17 +5,22 @@ All endpoints require the X-Platform-Key header matching APP_KEY from .env
 so only our Supabase Edge Functions can call these, not end users.
 
 Endpoints:
-  POST /api/v1/platform/create-user          Create OpenAlgo user + return API key
-  POST /api/v1/platform/create-strategy      Create strategy for a user in OpenAlgo
-  GET  /api/v1/platform/strategies/<user>    List all strategies for a user
-  DELETE /api/v1/platform/strategy/<id>      Delete a strategy
+  POST /api/v1/platform/create-user              Create OpenAlgo user + return API key
+  POST /api/v1/platform/create-strategy          Create strategy for a user in OpenAlgo
+  GET  /api/v1/platform/strategies/<user>        List all strategies for a user
+  DELETE /api/v1/platform/strategy/<id>          Delete a strategy
+  GET  /api/v1/platform/zerodha/login-url        Return Zerodha Kite Connect login URL
+                                                  with signed platform state so callback
+                                                  redirects back to ChartMate (no OpenAlgo UI).
 """
 
 import os
 import secrets
 import uuid
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, redirect, request
+
+from utils.platform_state import sign_platform_state
 
 from database.auth_db import get_api_key_for_tradingview, upsert_api_key, upsert_auth
 from database.strategy_db import (
@@ -225,3 +230,44 @@ def delete_platform_strategy(strategy_id: int):
     if success:
         return jsonify({"success": True}), 200
     return jsonify({"error": "Strategy not found"}), 404
+
+
+# ── Zerodha Platform Login URL ─────────────────────────────────────────────────
+
+@platform_api_bp.route("/zerodha/login-url", methods=["GET"])
+def platform_zerodha_login_url():
+    """
+    Generate a Zerodha Kite Connect login URL that returns the user back to
+    ChartMate (not OpenAlgo's own dashboard).
+
+    Query params:
+      username    — The OpenAlgo username to associate the token with after callback.
+      return_url  — Full URL of ChartMate's /broker-callback page.
+
+    The generated URL embeds a signed state parameter. OpenAlgo's /zerodha/callback
+    detects this state, exchanges the request_token → access_token, stores it for
+    <username> in OpenAlgo, then redirects to <return_url>?broker=zerodha&broker_token=...
+    — the user never sees any OpenAlgo UI.
+    """
+    if not _authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    username = (request.args.get("username") or "").strip()
+    return_url = (request.args.get("return_url") or "").strip()
+
+    if not username or not return_url:
+        return jsonify({"error": "username and return_url are required"}), 400
+    if not return_url.startswith("http"):
+        return jsonify({"error": "return_url must be a full URL"}), 400
+
+    broker_api_key = os.getenv("BROKER_API_KEY", "").strip()
+    if not broker_api_key:
+        return jsonify({"error": "BROKER_API_KEY not configured on OpenAlgo server"}), 503
+
+    state = sign_platform_state(username, return_url)
+    login_url = (
+        f"https://kite.zerodha.com/connect/login"
+        f"?v=3&api_key={broker_api_key}&state={state}"
+    )
+    logger.info(f"Platform zerodha login URL generated for username={username}")
+    return jsonify({"url": login_url}), 200

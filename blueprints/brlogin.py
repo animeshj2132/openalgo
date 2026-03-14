@@ -3,6 +3,7 @@ import hashlib
 import http.client
 import json
 import os
+from urllib.parse import quote as _url_quote
 
 import jwt
 from flask import Blueprint, jsonify, make_response, redirect, request, session, url_for
@@ -17,6 +18,7 @@ from utils.config import (
     get_login_rate_limit_min,
 )
 from utils.logging import get_logger
+from utils.platform_state import parse_platform_state
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -40,6 +42,46 @@ def broker_callback(broker, para=None):
     logger.info(f"Broker callback initiated for: {broker}")
     logger.debug(f"Session contents: {dict(session)}")
     logger.info(f"Session has user key: {'user' in session}")
+
+    # ── Platform OAuth fast-path (ChartMate → broker → back to ChartMate) ─────
+    # When ChartMate initiates broker OAuth it embeds a signed state containing
+    # the target OpenAlgo username and the ChartMate return URL.
+    # We handle the full token exchange here without touching the OpenAlgo session,
+    # then redirect back to ChartMate so the user never sees OpenAlgo.
+    _state_raw = request.args.get("state", "")
+    _platform_username, _platform_return_url = parse_platform_state(_state_raw)
+
+    if _platform_username and _platform_return_url and broker == "zerodha":
+        logger.info(f"Platform OAuth callback for zerodha, username={_platform_username}")
+        request_token = request.args.get("request_token", "")
+        if not request_token:
+            err_url = f"{_platform_return_url}?status=error&error=no_request_token"
+            return redirect(err_url)
+
+        # Exchange request_token → access_token using OpenAlgo's zerodha auth module
+        from broker.zerodha.api.auth_api import authenticate_broker as _zauth
+        access_token, err = _zauth(request_token)
+        if not access_token:
+            logger.error(f"Zerodha platform auth failed: {err}")
+            err_url = f"{_platform_return_url}?status=error&error={_url_quote(err or 'auth_failed')}"
+            return redirect(err_url)
+
+        # Build full token (api_key:access_token) as OpenAlgo expects
+        _api_key = get_broker_api_key()
+        full_token = f"{_api_key}:{access_token}"
+
+        # Store broker session in OpenAlgo's auth_db for this platform user
+        from database.auth_db import upsert_auth as _upsert_auth
+        _upsert_auth(_platform_username, full_token, "zerodha")
+        logger.info(f"Platform zerodha session stored for username={_platform_username}")
+
+        # Redirect back to ChartMate — user never sees any OpenAlgo page
+        success_url = (
+            f"{_platform_return_url}"
+            f"?broker=zerodha&broker_token={_url_quote(full_token)}&status=success"
+        )
+        return redirect(success_url)
+    # ── End platform OAuth fast-path ──────────────────────────────────────────
 
     # Special handling for Compositedge - it comes from external OAuth and might lose session
     if broker == "compositedge" and "user" not in session:
