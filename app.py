@@ -244,6 +244,7 @@ def create_app():
     app.register_blueprint(logging_bp)  # Register Logging blueprint
     app.register_blueprint(admin_bp)  # Register Admin blueprint
     app.register_blueprint(platform_api_bp)  # Register ChartMate platform API blueprint
+    csrf.exempt(platform_api_bp)             # Platform API uses X-Platform-Key auth, not CSRF tokens
     app.register_blueprint(historify_bp)  # Register Historify blueprint
     app.register_blueprint(ivchart_bp)  # Register IV chart blueprint
     app.register_blueprint(oitracker_bp)  # Register OI tracker blueprint
