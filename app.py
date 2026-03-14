@@ -62,6 +62,7 @@ from blueprints.search import search_bp
 from blueprints.security import security_bp  # Import the security blueprint
 from blueprints.settings import settings_bp  # Import the settings blueprint
 from blueprints.strategy import strategy_bp  # Import the strategy blueprint
+from blueprints.platform_api import platform_api_bp  # ChartMate platform integration API
 from blueprints.system_permissions import (
     system_permissions_bp,  # Import the system permissions blueprint
 )
@@ -242,6 +243,7 @@ def create_app():
     app.register_blueprint(playground_bp)  # Register API playground blueprint
     app.register_blueprint(logging_bp)  # Register Logging blueprint
     app.register_blueprint(admin_bp)  # Register Admin blueprint
+    app.register_blueprint(platform_api_bp)  # Register ChartMate platform API blueprint
     app.register_blueprint(historify_bp)  # Register Historify blueprint
     app.register_blueprint(ivchart_bp)  # Register IV chart blueprint
     app.register_blueprint(oitracker_bp)  # Register OI tracker blueprint
