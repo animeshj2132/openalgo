@@ -36,7 +36,9 @@ def map_order_data(order_data):
 
             # Check if a symbol was found; if so, update the trading_symbol in the current order
             if symbol:
-                order["tradingsymbol"] = get_oa_symbol(brsymbol=symbol, exchange=exchange)
+                oa_symbol = get_oa_symbol(brsymbol=symbol, exchange=exchange)
+                # Fall back to the original broker symbol if OA mapping not found
+                order["tradingsymbol"] = oa_symbol if oa_symbol else symbol
             else:
                 logger.info(
                     f"{symbol} and exchange {exchange} not found. Keeping original trading symbol."
@@ -94,6 +96,20 @@ def transform_order_data(orders):
 
     transformed_orders = []
 
+    STATUS_MAP = {
+        "COMPLETE": "complete",
+        "REJECTED": "rejected",
+        "TRIGGER PENDING": "trigger pending",
+        "OPEN": "open",
+        "CANCELLED": "cancelled",
+        "AMO REQ RECEIVED": "open",
+        "AFTER MARKET ORDER REQ RECEIVED": "open",
+        "MODIFY PENDING": "open",
+        "CANCEL PENDING": "pending",
+        "VALIDATION PENDING": "pending",
+        "PUT ORDER REQ RECEIVED": "pending",
+    }
+
     for order in orders:
         # Make sure each item is indeed a dictionary
         if not isinstance(order, dict):
@@ -102,19 +118,14 @@ def transform_order_data(orders):
             )
             continue
 
-        if order.get("status", "") == "COMPLETE":
-            order_status = "complete"
-        if order.get("status", "") == "REJECTED":
-            order_status = "rejected"
-        if order.get("status", "") == "TRIGGER PENDING":
-            order_status = "trigger pending"
-        if order.get("status", "") == "OPEN":
-            order_status = "open"
-        if order.get("status", "") == "CANCELLED":
-            order_status = "cancelled"
+        raw_status = order.get("status", "")
+        order_status = STATUS_MAP.get(raw_status.upper() if raw_status else "", raw_status.lower() if raw_status else "unknown")
+
+        # Keep original broker symbol as fallback if tradingsymbol is None
+        symbol = order.get("tradingsymbol") or ""
 
         transformed_order = {
-            "symbol": order.get("tradingsymbol", ""),
+            "symbol": symbol,
             "exchange": order.get("exchange", ""),
             "action": order.get("transaction_type", ""),
             "quantity": order.get("quantity", 0),
@@ -139,16 +150,18 @@ def map_trade_data(trade_data):
 def transform_tradebook_data(tradebook_data):
     transformed_data = []
     for trade in tradebook_data:
+        qty = trade.get("quantity", 0) or 0
+        avg = float(trade.get("average_price", 0.0) or 0.0)
         transformed_trade = {
-            "symbol": trade.get("tradingsymbol"),
+            "symbol": trade.get("tradingsymbol") or "",
             "exchange": trade.get("exchange", ""),
             "product": trade.get("product", ""),
             "action": trade.get("transaction_type", ""),
-            "quantity": trade.get("quantity", 0),
-            "average_price": trade.get("average_price", 0.0),
-            "trade_value": trade.get("quantity", 0) * trade.get("average_price", 0.0),
+            "quantity": qty,
+            "average_price": round(avg, 2),
+            "trade_value": round(qty * avg, 2),
             "orderid": trade.get("order_id", ""),
-            "timestamp": trade.get("order_timestamp", ""),
+            "timestamp": trade.get("order_timestamp", "") or trade.get("fill_timestamp", ""),
         }
         transformed_data.append(transformed_trade)
     return transformed_data
@@ -184,7 +197,9 @@ def map_position_data(position_data):
 
             # Check if a symbol was found; if so, update the trading_symbol in the current order
             if symbol:
-                position["tradingsymbol"] = get_oa_symbol(brsymbol=symbol, exchange=exchange)
+                oa_symbol = get_oa_symbol(brsymbol=symbol, exchange=exchange)
+                # Fall back to the original broker symbol if OA mapping not found
+                position["tradingsymbol"] = oa_symbol if oa_symbol else symbol
             else:
                 logger.info(
                     f"{symbol} and exchange {exchange} not found. Keeping original trading symbol."
@@ -197,17 +212,17 @@ def transform_positions_data(positions_data):
     transformed_data = []
 
     for position in positions_data:
-        # Ensure average_price is treated as a float, then format to a string with 2 decimal places
-        average_price_formatted = "{:.2f}".format(float(position.get("average_price", 0.0)))
+        avg = float(position.get("average_price", 0.0) or 0.0)
+        qty = int(position.get("quantity", 0) or 0)
 
         transformed_position = {
-            "symbol": position.get("tradingsymbol", ""),
+            "symbol": position.get("tradingsymbol") or "",
             "exchange": position.get("exchange", ""),
             "product": position.get("product", ""),
-            "quantity": position.get("quantity", "0"),
-            "pnl": round(position.get("pnl", 0.0), 2),  # Rounded to two decimals
-            "average_price": average_price_formatted,
-            "ltp": round(position.get("last_price", 0.0), 2),
+            "quantity": qty,
+            "pnl": round(float(position.get("pnl", 0.0) or 0.0), 2),
+            "average_price": round(avg, 2),
+            "ltp": round(float(position.get("last_price", 0.0) or 0.0), 2),
         }
         transformed_data.append(transformed_position)
     return transformed_data
