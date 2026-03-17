@@ -211,6 +211,13 @@ def place_order_with_auth(
             )
         order_response_data = {"status": "success", "orderid": order_id}
         executor.submit(async_log_order, "placeorder", order_request_data, order_response_data)
+        # Register live auto-exit (non-blocking) for ChartMate strategies with SL/TP
+        try:
+            from services.auto_exit_service import register_entry_if_applicable
+
+            socketio.start_background_task(register_entry_if_applicable, original_data, order_response_data)
+        except Exception:
+            pass
         # Send Telegram alert in background task (non-blocking)
         # Moves DB lookups + formatting off request thread entirely
         socketio.start_background_task(

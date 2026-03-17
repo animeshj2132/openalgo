@@ -83,6 +83,7 @@ from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
 from database.settings_db import init_db as ensure_settings_tables_exists
 from database.strategy_db import init_db as ensure_strategy_tables_exists
+from database.auto_exit_db import init_db as ensure_auto_exit_tables_exists
 from database.symbol import init_db as ensure_master_contract_tables_exists
 from database.telegram_db import get_bot_config
 from database.traffic_db import init_logs_db as ensure_traffic_logs_exists
@@ -503,6 +504,7 @@ def setup_environment(app):
             ("Traffic Logs DB", ensure_traffic_logs_exists),
             ("Latency DB", ensure_latency_tables_exists),
             ("Strategy DB", ensure_strategy_tables_exists),
+            ("Auto Exit DB", ensure_auto_exit_tables_exists),
             ("Sandbox DB", ensure_sandbox_tables_exists),
             ("Action Center DB", ensure_action_center_tables_exists),
             ("Chart Prefs DB", ensure_chart_prefs_tables_exists),
@@ -696,6 +698,15 @@ if is_docker:
 else:
     logger.debug("Running in local/integrated mode - Starting WebSocket proxy in Flask")
     start_websocket_proxy(app)
+
+# Start AutoExit engine (always-on)
+try:
+    from services.auto_exit_service import start_auto_exit_service
+
+    start_auto_exit_service()
+    logger.debug("AutoExitService started")
+except Exception as e:
+    logger.exception(f"Failed to start AutoExitService: {e}")
 
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == "__main__":

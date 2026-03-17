@@ -2,7 +2,7 @@ import logging
 import os
 
 from cachetools import TTLCache
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Time, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Time, create_engine, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, scoped_session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -50,6 +50,8 @@ class Strategy(Base):
     start_time = Column(String(5))  # HH:MM format
     end_time = Column(String(5))  # HH:MM format
     squareoff_time = Column(String(5))  # HH:MM format
+    stop_loss_pct = Column(Float, nullable=True)     # optional, % from entry
+    take_profit_pct = Column(Float, nullable=True)   # optional, % from entry
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -83,6 +85,21 @@ def init_db():
 
     init_db_with_logging(Base, engine, "Strategy DB", logger)
 
+    # Best-effort schema evolution (no Alembic in OpenAlgo)
+    try:
+        from sqlalchemy import inspect
+
+        insp = inspect(engine)
+        cols = {c["name"] for c in insp.get_columns("strategies")}
+        if "stop_loss_pct" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE strategies ADD COLUMN stop_loss_pct FLOAT"))
+        if "take_profit_pct" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE strategies ADD COLUMN take_profit_pct FLOAT"))
+    except Exception as e:
+        logger.debug(f"Strategy DB: schema check skipped/failed: {e}")
+
 
 def create_strategy(
     name,
@@ -93,6 +110,8 @@ def create_strategy(
     start_time=None,
     end_time=None,
     squareoff_time=None,
+    stop_loss_pct=None,
+    take_profit_pct=None,
     platform="tradingview",
 ):
     """Create a new strategy"""
@@ -106,6 +125,8 @@ def create_strategy(
             start_time=start_time,
             end_time=end_time,
             squareoff_time=squareoff_time,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
             platform=platform,
         )
         db_session.add(strategy)
@@ -259,6 +280,31 @@ def add_symbol_mapping(strategy_id, symbol, exchange, quantity, product_type):
         logger.exception(f"Error adding symbol mapping: {str(e)}")
         db_session.rollback()
         return None
+
+
+def update_strategy_risk(user_id: str, name: str, stop_loss_pct: float | None, take_profit_pct: float | None):
+    """Update SL/TP% for a strategy identified by (user_id, name, platform='chartmate')."""
+    try:
+        s = Strategy.query.filter_by(user_id=user_id, name=name, platform="chartmate").first()
+        if not s:
+            return False
+
+        s.stop_loss_pct = float(stop_loss_pct) if stop_loss_pct is not None else None
+        s.take_profit_pct = float(take_profit_pct) if take_profit_pct is not None else None
+        db_session.commit()
+
+        # Invalidate caches
+        if s.webhook_id in _strategy_webhook_cache:
+            del _strategy_webhook_cache[s.webhook_id]
+        user_cache_key = f"user_{user_id}"
+        if user_cache_key in _user_strategies_cache:
+            del _user_strategies_cache[user_cache_key]
+
+        return True
+    except Exception as e:
+        logger.exception(f"Error updating strategy risk {user_id}:{name}: {str(e)}")
+        db_session.rollback()
+        return False
 
 
 def bulk_add_symbol_mappings(strategy_id, mappings):

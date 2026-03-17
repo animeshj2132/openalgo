@@ -28,7 +28,9 @@ from database.strategy_db import (
     create_strategy,
     delete_strategy,
     get_user_strategies,
+    update_strategy_risk,
 )
+from database.auto_exit_db import AutoExitTrade
 from database.user_db import add_user
 from utils.logging import get_logger
 
@@ -119,6 +121,8 @@ def create_platform_strategy():
     end_time        = body.get("end_time") or "15:15"
     squareoff_time  = body.get("squareoff_time") or "15:15"
     symbols = body.get("symbols") or []
+    stop_loss_pct = body.get("stop_loss_pct")
+    take_profit_pct = body.get("take_profit_pct")
 
     if not username or not name:
         return jsonify({"error": "username and name are required"}), 400
@@ -133,6 +137,8 @@ def create_platform_strategy():
         start_time=start_time,
         end_time=end_time,
         squareoff_time=squareoff_time,
+        stop_loss_pct=float(stop_loss_pct) if stop_loss_pct is not None else None,
+        take_profit_pct=float(take_profit_pct) if take_profit_pct is not None else None,
         platform="chartmate",
     )
     if not strategy:
@@ -230,6 +236,87 @@ def delete_platform_strategy(strategy_id: int):
     if success:
         return jsonify({"success": True}), 200
     return jsonify({"error": "Strategy not found"}), 404
+
+
+# ── Update Strategy Risk ──────────────────────────────────────────────────────
+
+@platform_api_bp.route("/update-strategy-risk", methods=["POST"])
+def update_platform_strategy_risk():
+    """
+    Update SL/TP% for a ChartMate strategy.
+    Body: { username, name, stop_loss_pct?, take_profit_pct? }
+    """
+    if not _authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body = request.get_json(force=True) or {}
+    username = (body.get("username") or "").strip()
+    name = (body.get("name") or "").strip()
+    stop_loss_pct = body.get("stop_loss_pct")
+    take_profit_pct = body.get("take_profit_pct")
+
+    if not username or not name:
+        return jsonify({"error": "username and name are required"}), 400
+
+    ok = update_strategy_risk(
+        user_id=username,
+        name=name,
+        stop_loss_pct=float(stop_loss_pct) if stop_loss_pct is not None else None,
+        take_profit_pct=float(take_profit_pct) if take_profit_pct is not None else None,
+    )
+    if not ok:
+        return jsonify({"error": "Strategy not found"}), 404
+    return jsonify({"success": True}), 200
+
+
+# ── Auto Exit Trades ──────────────────────────────────────────────────────────
+
+@platform_api_bp.route("/auto-exit-trades/<username>", methods=["GET"])
+def list_auto_exit_trades(username: str):
+    """
+    List recent auto-exit tracked trades for a user.
+    Protected: requires X-Platform-Key (server-to-server).
+    """
+    if not _authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    username = (username or "").strip()
+    if not username:
+        return jsonify({"error": "username is required"}), 400
+
+    try:
+        rows = (
+            AutoExitTrade.query.filter_by(user_id=username)
+            .order_by(AutoExitTrade.created_at.desc())
+            .limit(200)
+            .all()
+        )
+        result = [
+            {
+                "id": r.id,
+                "user_id": r.user_id,
+                "strategy_name": r.strategy_name,
+                "exchange": r.exchange,
+                "symbol": r.symbol,
+                "product": r.product,
+                "action": r.action,
+                "quantity": r.quantity,
+                "entry_orderid": r.entry_orderid,
+                "entry_price": r.entry_price,
+                "stop_loss_price": r.stop_loss_price,
+                "take_profit_price": r.take_profit_price,
+                "status": r.status,
+                "exit_orderid": r.exit_orderid,
+                "error_message": r.error_message,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ]
+        return jsonify({"trades": result}), 200
+    except Exception as exc:
+        logger.exception(f"platform_api: list auto-exit trades failed for {username}: {exc}")
+        return jsonify({"error": "Failed to list auto-exit trades"}), 500
 
 
 # ── Zerodha Platform OAuth ─────────────────────────────────────────────────────
