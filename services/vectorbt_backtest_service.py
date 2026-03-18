@@ -432,6 +432,7 @@ def run_vectorbt_backtest(
     wins = 0
     losses = 0
     sample: list[dict[str, Any]] = []
+    trades_list: list[dict[str, Any]] = []
     trade_returns: list[float] = []
     try:
         tr = np.asarray(trades.returns, dtype=float)
@@ -442,7 +443,7 @@ def run_vectorbt_backtest(
             wr = (wins / len(trade_returns) * 100) if trade_returns else 0.0
         rec = getattr(trades, "records", None)
         if rec is not None and len(rec) and getattr(rec.dtype, "names", None):
-            for k in range(min(8, len(rec))):
+            for k in range(min(500, len(rec))):
                 row = rec[k]
                 ei = int(row["entry_idx"])
                 xi = int(row["exit_idx"])
@@ -451,14 +452,24 @@ def run_vectorbt_backtest(
                 except (ValueError, KeyError, TypeError):
                     rv = float(trade_returns[k]) if k < len(trade_returns) else 0.0
                 er = rv * 100
-                sample.append(
-                    {
-                        "entryDate": str(c.index[ei].date()) if 0 <= ei < len(c) else "—",
-                        "exitDate": str(c.index[xi].date()) if 0 <= xi < len(c) else "—",
-                        "returnPct": round(er, 2),
-                        "profitable": er > 0,
-                    }
-                )
+                entry_date = str(c.index[ei].date()) if 0 <= ei < len(c) else "—"
+                exit_date = str(c.index[xi].date()) if 0 <= xi < len(c) else "—"
+                entry_price = float(price.iloc[ei]) if 0 <= ei < len(price) else None
+                exit_price = float(price.iloc[xi]) if 0 <= xi < len(price) else None
+                holding_days = (xi - ei) if (0 <= ei < len(c) and 0 <= xi < len(c)) else None
+
+                item = {
+                    "entryDate": entry_date,
+                    "exitDate": exit_date,
+                    "entryPrice": round(entry_price, 4) if entry_price is not None else None,
+                    "exitPrice": round(exit_price, 4) if exit_price is not None else None,
+                    "holdingDays": holding_days,
+                    "returnPct": round(er, 2),
+                    "profitable": bool(er > 0),
+                }
+                trades_list.append(item)
+                if len(sample) < 8:
+                    sample.append(item)
         elif trade_returns:
             for _k, rv in enumerate(trade_returns[:8]):
                 sample.append(
@@ -520,17 +531,34 @@ def run_vectorbt_backtest(
         {
             "entryDate": str(t.get("entryDate", "—")),
             "exitDate": str(t.get("exitDate", "—")),
+            "entryPrice": None if t.get("entryPrice") is None else float(t.get("entryPrice")),
+            "exitPrice": None if t.get("exitPrice") is None else float(t.get("exitPrice")),
+            "holdingDays": None if t.get("holdingDays") is None else int(t.get("holdingDays")),
             "returnPct": float(t.get("returnPct", 0.0)),
             "profitable": bool(t.get("profitable", False)),
         }
         for t in sample
     ]
 
+    trades_py: list[dict[str, Any]] = [
+        {
+            "entryDate": str(t.get("entryDate", "—")),
+            "exitDate": str(t.get("exitDate", "—")),
+            "entryPrice": None if t.get("entryPrice") is None else float(t.get("entryPrice")),
+            "exitPrice": None if t.get("exitPrice") is None else float(t.get("exitPrice")),
+            "holdingDays": None if t.get("holdingDays") is None else int(t.get("holdingDays")),
+            "returnPct": float(t.get("returnPct", 0.0)),
+            "profitable": bool(t.get("profitable", False)),
+        }
+        for t in trades_list
+    ]
+
     return {
         "engine": "vectorbt",
         "action": action.upper(),
         "backtestPeriod": f"{len(c)} daily bars",
-        "data_source": str(used_source),
+        # Don't expose provider names to the UI.
+        "data_source": "market_data",
         "symbol": symbol.upper(),
         "exchange": (exchange or "NSE").upper(),
         "strategy": str(strategy),
@@ -544,6 +572,7 @@ def run_vectorbt_backtest(
         "profitFactor": float(round(pfactor, 2)),
         "sharpeRatio": float(round(sharpe, 3)),
         "sampleTrades": sample_py,
+        "trades": trades_py,
         "strategyAchieved": achieved_py,
         "achievementReason": str(reason),
         "currentIndicators": {
