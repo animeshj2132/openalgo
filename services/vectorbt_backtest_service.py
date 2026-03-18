@@ -11,8 +11,8 @@ Signals mirror the Deno `backtest-strategy` simulation logic for consistency.
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
@@ -85,9 +85,9 @@ def _load_ohlc_from_broker_api(
     if not openalgo_api_key:
         return None
     days = max(60, min(int(days or 365), 730))
-    now_ist = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
+    now_ist = dt.datetime.now(dt.UTC).astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30)))
     end_date = now_ist.strftime("%Y-%m-%d")
-    start_date = (now_ist - timedelta(days=days + 60)).strftime("%Y-%m-%d")
+    start_date = (now_ist - dt.timedelta(days=days + 60)).strftime("%Y-%m-%d")
 
     ok, payload, _status = get_history(
         symbol=symbol,
@@ -133,8 +133,8 @@ def _load_ohlc(
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, str]:
     """Returns close, high, low, open (all Series, DatetimeIndex) and data_source label."""
     days = max(60, min(int(days or 365), 730))
-    now = datetime.now(timezone.utc)
-    start_ts = int((now - timedelta(days=days + 60)).timestamp())
+    now = dt.datetime.now(dt.UTC)
+    start_ts = int((now - dt.timedelta(days=days + 60)).timestamp())
     end_ts = int(now.timestamp())
 
     sym = symbol.upper().strip()
@@ -393,10 +393,10 @@ def run_vectorbt_backtest(
     )
     c = close.astype(float)
     h = high.astype(float).reindex(c.index).fillna(c)
-    l = low.astype(float).reindex(c.index).fillna(c)
+    lo = low.astype(float).reindex(c.index).fillna(c)
     closes = c.values
     highs = h.values
-    lows = l.values
+    lows = lo.values
 
     entries, exits = _simulate_signals(
         strategy,
@@ -460,7 +460,7 @@ def run_vectorbt_backtest(
                     }
                 )
         elif trade_returns:
-            for k, rv in enumerate(trade_returns[:8]):
+            for _k, rv in enumerate(trade_returns[:8]):
                 sample.append(
                     {
                         "entryDate": "—",
@@ -499,7 +499,7 @@ def run_vectorbt_backtest(
     rsi_l = float(rsi[last]) if not np.isnan(rsi[last]) else 50.0
     high20d = float(np.max(highs[max(0, last - 20) : last]))
     low20d = float(np.min(lows[max(0, last - 20) : last]))
-    achieved = False
+    achieved: bool | Any = False
     reason = ""
     if strategy == "trend_following" and action.upper() == "BUY":
         achieved = closes[last] > sma20_l and rsi_l > 45
@@ -514,31 +514,43 @@ def run_vectorbt_backtest(
         achieved = True
         reason = "See full backtest metrics; live filter varies by strategy."
 
+    achieved_py = bool(achieved)
+    # Ensure JSON-safe primitives (avoid numpy scalar types leaking into jsonify).
+    sample_py: list[dict[str, Any]] = [
+        {
+            "entryDate": str(t.get("entryDate", "—")),
+            "exitDate": str(t.get("exitDate", "—")),
+            "returnPct": float(t.get("returnPct", 0.0)),
+            "profitable": bool(t.get("profitable", False)),
+        }
+        for t in sample
+    ]
+
     return {
         "engine": "vectorbt",
-        "data_source": used_source,
-        "symbol": symbol.upper(),
-        "exchange": (exchange or "NSE").upper(),
-        "strategy": strategy,
         "action": action.upper(),
         "backtestPeriod": f"{len(c)} daily bars",
-        "totalTrades": n_trades,
-        "wins": wins,
-        "losses": losses,
-        "winRate": round(wr, 2),
-        "totalReturn": round(tot_ret, 2),
-        "avgReturn": round(tot_ret / n_trades, 4) if n_trades else 0.0,
-        "maxDrawdown": round(mdd, 2),
-        "profitFactor": round(pfactor, 2),
-        "sharpeRatio": round(sharpe, 3),
-        "sampleTrades": sample,
-        "strategyAchieved": achieved,
-        "achievementReason": reason,
+        "data_source": str(used_source),
+        "symbol": symbol.upper(),
+        "exchange": (exchange or "NSE").upper(),
+        "strategy": str(strategy),
+        "totalTrades": int(n_trades),
+        "wins": int(wins),
+        "losses": int(losses),
+        "winRate": float(round(wr, 2)),
+        "totalReturn": float(round(tot_ret, 2)),
+        "avgReturn": float(round(tot_ret / n_trades, 4)) if n_trades else 0.0,
+        "maxDrawdown": float(round(mdd, 2)),
+        "profitFactor": float(round(pfactor, 2)),
+        "sharpeRatio": float(round(sharpe, 3)),
+        "sampleTrades": sample_py,
+        "strategyAchieved": achieved_py,
+        "achievementReason": str(reason),
         "currentIndicators": {
-            "price": round(float(closes[last]), 2),
-            "sma20": round(sma20_l, 2),
-            "rsi14": round(rsi_l, 2),
-            "high20d": round(high20d, 2),
-            "low20d": round(low20d, 2),
+            "price": float(round(float(closes[last]), 2)),
+            "sma20": float(round(float(sma20_l), 2)),
+            "rsi14": float(round(float(rsi_l), 2)),
+            "high20d": float(round(float(high20d), 2)),
+            "low20d": float(round(float(low20d), 2)),
         },
     }

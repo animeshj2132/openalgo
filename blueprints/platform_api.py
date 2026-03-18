@@ -20,9 +20,8 @@ import uuid
 
 from flask import Blueprint, jsonify, make_response, redirect, request
 
-from utils.platform_state import sign_platform_ctx, sign_platform_state
-
 from database.auth_db import get_api_key_for_tradingview, upsert_api_key, upsert_auth
+from database.auto_exit_db import AutoExitTrade
 from database.strategy_db import (
     add_symbol_mapping,
     create_strategy,
@@ -30,9 +29,9 @@ from database.strategy_db import (
     get_user_strategies,
     update_strategy_risk,
 )
-from database.auto_exit_db import AutoExitTrade
 from database.user_db import add_user
 from utils.logging import get_logger
+from utils.platform_state import sign_platform_ctx, sign_platform_state
 
 logger = get_logger(__name__)
 
