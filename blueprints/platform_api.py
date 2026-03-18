@@ -269,6 +269,69 @@ def update_platform_strategy_risk():
     return jsonify({"success": True}), 200
 
 
+# ── VectorBT backtest (Historify → Yahoo fallback) ───────────────────────────
+
+@platform_api_bp.route("/vectorbt-backtest", methods=["POST"])
+def platform_vectorbt_backtest():
+    """
+    Run VectorBT engine on daily OHLCV with multi-source data:
+    - broker API (if openalgo_api_key provided and data_source allows)
+    - Historify DuckDB
+    - Yahoo fallback
+
+    Body:
+      {
+        symbol,
+        exchange?,
+        strategy?,
+        action?,
+        days?,
+        stop_loss_pct?,
+        take_profit_pct?,
+        max_hold_days?,
+        data_source?: "auto" | "broker" | "historify" | "yahoo",
+        openalgo_api_key?: string
+      }
+    """
+    if not _authorized(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    body = request.get_json(force=True) or {}
+    symbol = (body.get("symbol") or "").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+
+    exchange = (body.get("exchange") or "NSE").strip().upper()
+    strategy = (body.get("strategy") or "trend_following").strip().lower()
+    action = (body.get("action") or "BUY").strip().upper()
+    days = int(body.get("days") or 365)
+    sl = float(body.get("stop_loss_pct") or 2.0)
+    tp = float(body.get("take_profit_pct") or 4.0)
+    max_hold = int(body.get("max_hold_days") or 10)
+    data_source = (body.get("data_source") or "auto").strip().lower()
+    openalgo_api_key = (body.get("openalgo_api_key") or "").strip()
+
+    try:
+        from services.vectorbt_backtest_service import run_vectorbt_backtest
+
+        out = run_vectorbt_backtest(
+            symbol=symbol,
+            exchange=exchange,
+            strategy=strategy,
+            action=action,
+            days=days,
+            stop_loss_pct=sl,
+            take_profit_pct=tp,
+            max_hold_days=max_hold,
+            data_source=data_source,
+            openalgo_api_key=openalgo_api_key or None,
+        )
+        return jsonify(out), 200
+    except Exception as exc:
+        logger.exception(f"platform_api vectorbt-backtest failed: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 # ── Auto Exit Trades ──────────────────────────────────────────────────────────
 
 @platform_api_bp.route("/auto-exit-trades/<username>", methods=["GET"])
