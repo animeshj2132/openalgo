@@ -490,8 +490,9 @@ class BrokerData:
             # Combine all chunks
             final_df = pd.concat(dfs, ignore_index=True)
 
-            # Convert timestamp to epoch properly using ISO format
-            final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], format="ISO8601")
+            # Convert timestamp to epoch (robust across pandas/python versions)
+            # Zerodha returns ISO8601 strings; avoid `format="ISO8601"` which can break on some runtimes.
+            final_df["timestamp"] = pd.to_datetime(final_df["timestamp"], utc=True, errors="coerce")
 
             # For daily timeframe, convert UTC to IST by adding 5 hours and 30 minutes
             if timeframe == "D":
