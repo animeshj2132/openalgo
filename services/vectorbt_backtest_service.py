@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 def _yahoo_ticker(symbol: str, exchange: str) -> str:
     ex = (exchange or "NSE").upper()
     s = symbol.upper().strip()
+
+    # If caller already provided a Yahoo-style ticker (US, crypto, forex, indices),
+    # use it as-is. Also allow explicit GLOBAL exchange.
+    if ex in {"GLOBAL", "US", "USA"}:
+        return s
+    if any(x in s for x in ("-", "=", "^", "/", ":")) or "." in s:
+        return s
     if ex == "BSE":
         return f"{s}.BO"
     return f"{s}.NS"
