@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,25 @@ from database.historify_db import get_ohlcv
 from services.history_service import get_history
 
 logger = logging.getLogger(__name__)
+
+
+def _json_sanitize(obj: Any) -> Any:
+    """
+    Recursively replace NaN/Inf floats so Flask jsonify produces valid JSON
+    (standard JSON does not allow Infinity or NaN).
+    """
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_sanitize(v) for v in obj]
+    if isinstance(obj, (float, np.floating)):
+        v = float(obj)
+        return 0.0 if not math.isfinite(v) else v
+    if isinstance(obj, (int, np.integer)):
+        return int(obj)
+    return obj
 
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
@@ -933,21 +953,23 @@ def run_vectorbt_backtest(
 
     # Aggregate metrics
     tot_ret = float(pf.total_return()) * 100
-    if np.isnan(tot_ret):
+    if not math.isfinite(tot_ret):
         tot_ret = 0.0
     try:
         mdd = float(pf.max_drawdown()) * 100
+        if not math.isfinite(mdd):
+            mdd = 0.0
     except Exception:
         mdd = 0.0
     try:
         sharpe = float(pf.sharpe_ratio())
-        if np.isnan(sharpe):
+        if not math.isfinite(sharpe):
             sharpe = 0.0
     except Exception:
         sharpe = 0.0
     try:
         pfactor = float(pf.trades.profit_factor()) if n_trades else 0.0
-        if np.isnan(pfactor):
+        if not math.isfinite(pfactor):
             pfactor = 0.0
     except Exception:
         pfactor = 0.0
@@ -1050,7 +1072,7 @@ def run_vectorbt_backtest(
         for t in trades_list
     ]
 
-    return {
+    payload: dict[str, Any] = {
         "engine": "vectorbt",
         "action": action.upper(),
         "backtestPeriod": f"{len(c)} daily bars",
@@ -1098,3 +1120,4 @@ def run_vectorbt_backtest(
             "low20d": float(round(float(low20d), 2)),
         },
     }
+    return _json_sanitize(payload)
