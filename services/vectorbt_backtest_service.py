@@ -6,8 +6,11 @@ Data sources (in order):
 2. OpenAlgo Historify (DuckDB) — server-side cached bars (typically broker-downloaded).
 3. Yahoo Finance — NSE (.NS) / BSE (.BO) fallback.
 
-Signals mirror the Deno `backtest-strategy` simulation logic for consistency.
-Custom strategies use the exact entry/exit conditions built in AlgoStrategyBuilder.
+Preset strategies mirror the Deno `backtest-strategy` simulation logic.
+Custom strategies evaluate AlgoStrategyBuilder entry_groups / exit rules bar-by-bar on the
+same OHLC series, then `vbt.Portfolio.from_signals` runs one position at a time (signal
+cleaning: no overlapping entries until exit). Optional `execution_days` filters entries
+by calendar day (0=Sun … 6=Sat, same as the builder).
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -415,6 +418,31 @@ def _evaluate_group_at_bar(
     return all(results) if logic == "AND" else any(results)
 
 
+def _execution_day_allowed(
+    date_index: pd.DatetimeIndex,
+    bar_i: int,
+    allowed: set[int] | None,
+) -> bool:
+    """
+    True if bar `bar_i` is on an allowed calendar day.
+    Matches AlgoStrategyBuilder: 0=Sun, 1=Mon, …, 6=Sat (pandas: Mon=0 … Sun=6).
+    """
+    if allowed is None or not allowed:
+        return True
+    if bar_i < 0 or bar_i >= len(date_index):
+        return False
+    builder_dow = (int(date_index[bar_i].dayofweek) + 1) % 7
+    return builder_dow in allowed
+
+
+def _normalize_execution_days(raw: Iterable[int] | None) -> set[int] | None:
+    """Return a set of builder day codes, or None = no filter."""
+    if not raw:
+        return None
+    out = {int(d) % 7 for d in raw}
+    return out or None
+
+
 def _evaluate_entry_conditions_at_bar(
     closes: np.ndarray,
     highs: np.ndarray,
@@ -449,6 +477,7 @@ def _evaluate_entry_conditions_at_bar(
 # ─── Signal generators ────────────────────────────────────────────────────────
 
 def _simulate_signals(
+    date_index: pd.DatetimeIndex,
     strategy: str,
     action: str,
     closes: np.ndarray,
@@ -457,6 +486,7 @@ def _simulate_signals(
     sl_pct: float,
     tp_pct: float,
     max_hold: int,
+    execution_days: list[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     """
     Preset-strategy signal generator.
@@ -466,6 +496,7 @@ def _simulate_signals(
     entries = np.zeros(n, dtype=bool)
     exits = np.zeros(n, dtype=bool)
     detailed_trades: list[dict[str, Any]] = []
+    day_allow = _normalize_execution_days(execution_days)
 
     sma20 = _sma(closes, 20)
     rsi = _rsi(closes, 14)
@@ -536,6 +567,8 @@ def _simulate_signals(
             signal = action == "BUY" and r > 50
 
         if signal and i + 1 < n:
+            if not _execution_day_allowed(date_index, i + 1, day_allow):
+                continue
             entries[i + 1] = True
             in_trade = True
             entry_price = float(closes[i + 1])
@@ -550,6 +583,7 @@ def _simulate_signals(
 
 
 def _simulate_custom_signals(
+    date_index: pd.DatetimeIndex,
     closes: np.ndarray,
     highs: np.ndarray,
     lows: np.ndarray,
@@ -560,16 +594,19 @@ def _simulate_custom_signals(
     sl_pct: float,
     tp_pct: float,
     max_hold: int,
+    execution_days: list[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
     """
     Custom strategy signal generator using AlgoStrategyBuilder entry/exit conditions.
     Evaluates each condition group at every bar.
     Falls back to exit_conditions.stopLossPct / takeProfitPct if provided.
+    Respects execution_days (0=Sun … 6=Sat) on the entry bar (next-session open).
     """
     n = len(closes)
     entries = np.zeros(n, dtype=bool)
     exits = np.zeros(n, dtype=bool)
     detailed_trades: list[dict[str, Any]] = []
+    day_allow = _normalize_execution_days(execution_days)
 
     # Use exit conditions SL/TP if set; caller sl_pct/tp_pct are the fallback
     ec_sl = float(exit_conditions.get("stopLossPct") or 0)
@@ -655,6 +692,8 @@ def _simulate_custom_signals(
         )
 
         if signal and i + 1 < n:
+            if not _execution_day_allowed(date_index, i + 1, day_allow):
+                continue
             entries[i + 1] = True
             in_trade = True
             entry_price = float(closes[i + 1])
@@ -701,6 +740,61 @@ def _build_trade_candles(
             "isExit": j == exit_idx,
         })
     return candles
+
+
+def _trade_record_from_indices(
+    trade_no: int,
+    ei: int,
+    xi: int,
+    c: pd.Series,
+    h: pd.Series,
+    lo: pd.Series,
+    op: pd.Series,
+    price: pd.Series,
+    sma20_arr: np.ndarray,
+    rsi_arr: np.ndarray,
+    macd_line: np.ndarray,
+    action: str,
+    exit_reason: str,
+) -> dict[str, Any]:
+    """Build one trade dict from bar indices (fees not included in return %)."""
+    entry_date = str(c.index[ei].date()) if 0 <= ei < len(c) else "—"
+    exit_date = str(c.index[xi].date()) if 0 <= xi < len(c) else "—"
+    entry_price_val = float(price.iloc[ei]) if 0 <= ei < len(price) else None
+    exit_price_val = float(price.iloc[xi]) if 0 <= xi < len(price) else None
+    holding_days = (xi - ei) if (0 <= ei < len(c) and 0 <= xi < len(c)) else None
+    abs_pnl = None
+    if entry_price_val is not None and exit_price_val is not None and entry_price_val:
+        if action.upper() == "BUY":
+            abs_pnl = round(exit_price_val - entry_price_val, 2)
+            er = (exit_price_val - entry_price_val) / entry_price_val * 100.0
+        else:
+            abs_pnl = round(entry_price_val - exit_price_val, 2)
+            er = (entry_price_val - exit_price_val) / entry_price_val * 100.0
+    else:
+        er = 0.0
+    entry_rsi = round(float(rsi_arr[ei]), 2) if 0 <= ei < len(rsi_arr) and not np.isnan(rsi_arr[ei]) else None
+    entry_sma20 = round(float(sma20_arr[ei]), 2) if 0 <= ei < len(sma20_arr) and not np.isnan(sma20_arr[ei]) else None
+    entry_macd = round(float(macd_line[ei]), 4) if 0 <= ei < len(macd_line) and not np.isnan(macd_line[ei]) else None
+    exit_rsi = round(float(rsi_arr[xi]), 2) if 0 <= xi < len(rsi_arr) and not np.isnan(rsi_arr[xi]) else None
+    candles = _build_trade_candles(c, h, lo, op, sma20_arr, rsi_arr, ei, xi, context_bars=5)
+    return {
+        "tradeNo": trade_no,
+        "entryDate": entry_date,
+        "exitDate": exit_date,
+        "entryPrice": round(entry_price_val, 2) if entry_price_val is not None else None,
+        "exitPrice": round(exit_price_val, 2) if exit_price_val is not None else None,
+        "holdingDays": holding_days,
+        "returnPct": round(er, 2),
+        "absPnl": abs_pnl,
+        "profitable": bool(er > 0),
+        "exitReason": exit_reason,
+        "entryRsi": entry_rsi,
+        "entrySma20": entry_sma20,
+        "entryMacd": entry_macd,
+        "exitRsi": exit_rsi,
+        "candles": candles,
+    }
 
 
 def _compute_historical_snapshots(
@@ -806,6 +900,7 @@ def run_vectorbt_backtest(
     entry_conditions: dict[str, Any] | None = None,
     exit_conditions: dict[str, Any] | None = None,
     custom_strategy_name: str | None = None,
+    execution_days: list[int] | None = None,
 ) -> dict[str, Any]:
     try:
         import vectorbt as vbt
@@ -848,13 +943,17 @@ def run_vectorbt_backtest(
             f"with {len(entry_conditions['groups'])} entry group(s)"
         )
         entries, exits, detailed_trades = _simulate_custom_signals(
+            c.index,
             closes, highs, lows, opens,
             action, entry_conditions, ec_out, sl, tp, max_hold,
+            execution_days=execution_days,
         )
         used_strategy_label = custom_strategy_name or "custom"
     else:
         entries, exits, detailed_trades = _simulate_signals(
+            c.index,
             strategy, action, closes, highs, lows, sl, tp, max_hold,
+            execution_days=execution_days,
         )
         used_strategy_label = strategy
 
@@ -890,9 +989,6 @@ def run_vectorbt_backtest(
         tr = np.asarray(trades.returns, dtype=float)
         if tr.size:
             trade_returns = [float(x) for x in tr.flatten()]
-            wins = int((tr > 0).sum())
-            losses = int((tr <= 0).sum())
-            wr = (wins / len(trade_returns) * 100) if trade_returns else 0.0
 
         rec = getattr(trades, "records", None)
         if rec is not None and len(rec) and getattr(rec.dtype, "names", None):
@@ -950,6 +1046,30 @@ def run_vectorbt_backtest(
                 })
     except Exception:
         pass
+
+    # VectorBT "records" shape varies by version; if count > 0 but list empty, rebuild from our simulator trail.
+    if not trades_list and detailed_trades:
+        for k, d in enumerate(detailed_trades[:500]):
+            trades_list.append(
+                _trade_record_from_indices(
+                    k + 1,
+                    int(d["entry_idx"]),
+                    int(d["exit_idx"]),
+                    c, h, lo, op, price,
+                    sma20_arr, rsi_arr, macd_line,
+                    action,
+                    str(d.get("exit_reason", "unknown")),
+                )
+            )
+
+    if trades_list:
+        wins = sum(1 for t in trades_list if t.get("profitable"))
+        losses = len(trades_list) - wins
+        wr = (wins / len(trades_list) * 100.0) if trades_list else 0.0
+    elif trade_returns:
+        wins = int((np.asarray(trade_returns) > 0).sum())
+        losses = int((np.asarray(trade_returns) <= 0).sum())
+        wr = (wins / len(trade_returns) * 100) if trade_returns else 0.0
 
     # Aggregate metrics
     tot_ret = float(pf.total_return()) * 100
@@ -1010,6 +1130,21 @@ def run_vectorbt_backtest(
                 {"date": str(sampled.index[i].date()), "value": round(float(sampled.iloc[i]), 2)}
                 for i in range(len(sampled))
             ]
+    except Exception:
+        pass
+
+    # Per-bar / daily portfolio return % (sampled for JSON size; aligns with VectorBT freq)
+    daily_returns: list[dict[str, Any]] = []
+    try:
+        dr = pf.daily_returns()
+        if dr is not None and hasattr(dr, "__len__") and len(dr) > 0:
+            step = max(1, len(dr) // 400)
+            for i in range(0, len(dr), step):
+                v = float(dr.iloc[i])
+                daily_returns.append({
+                    "date": str(dr.index[i].date()),
+                    "returnPct": round(v * 100.0, 4),
+                })
     except Exception:
         pass
 
@@ -1081,6 +1216,7 @@ def run_vectorbt_backtest(
         "exchange": (exchange or "NSE").upper(),
         "strategy": used_strategy_label,
         "usedCustomConditions": use_custom,
+        "executionDaysApplied": list(execution_days) if execution_days else None,
         # Core metrics
         "totalTrades": int(n_trades),
         "wins": int(wins),
@@ -1105,6 +1241,7 @@ def run_vectorbt_backtest(
         "sampleTrades": trades_py[:8],
         "trades": trades_py,
         "equityCurve": equity_curve,
+        "dailyReturns": daily_returns,
         # Historical what-if snapshots
         "historicalSnapshots": historical_snapshots,
         # Strategy live check

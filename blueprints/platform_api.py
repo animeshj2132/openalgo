@@ -292,7 +292,8 @@ def platform_vectorbt_backtest():
         openalgo_api_key?: string,
         entry_conditions?: object,    -- AlgoStrategyBuilder EntryConditions JSON
         exit_conditions?: object,     -- AlgoStrategyBuilder ExitConditions JSON
-        custom_strategy_name?: string
+        custom_strategy_name?: string,
+        execution_days?: number[]     -- 0=Sun … 6=Sat; omit or empty = all days
       }
     """
     if not _authorized(request):
@@ -315,6 +316,13 @@ def platform_vectorbt_backtest():
     entry_conditions = body.get("entry_conditions") or None
     exit_conditions = body.get("exit_conditions") or None
     custom_strategy_name = (body.get("custom_strategy_name") or "").strip() or None
+    _ed = body.get("execution_days")
+    execution_days = None
+    if isinstance(_ed, list) and _ed:
+        try:
+            execution_days = [int(x) for x in _ed]
+        except (TypeError, ValueError):
+            execution_days = None
 
     try:
         from services.vectorbt_backtest_service import run_vectorbt_backtest
@@ -333,6 +341,7 @@ def platform_vectorbt_backtest():
             entry_conditions=entry_conditions,
             exit_conditions=exit_conditions,
             custom_strategy_name=custom_strategy_name,
+            execution_days=execution_days,
         )
         return jsonify(out), 200
     except Exception as exc:
