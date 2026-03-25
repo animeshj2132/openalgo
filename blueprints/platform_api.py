@@ -289,7 +289,10 @@ def platform_vectorbt_backtest():
         take_profit_pct?,
         max_hold_days?,
         data_source?: "auto" | "broker" | "historify" | "yahoo",
-        openalgo_api_key?: string
+        openalgo_api_key?: string,
+        entry_conditions?: object,    -- AlgoStrategyBuilder EntryConditions JSON
+        exit_conditions?: object,     -- AlgoStrategyBuilder ExitConditions JSON
+        custom_strategy_name?: string
       }
     """
     if not _authorized(request):
@@ -309,6 +312,9 @@ def platform_vectorbt_backtest():
     max_hold = int(body.get("max_hold_days") or 10)
     data_source = (body.get("data_source") or "auto").strip().lower()
     openalgo_api_key = (body.get("openalgo_api_key") or "").strip()
+    entry_conditions = body.get("entry_conditions") or None
+    exit_conditions = body.get("exit_conditions") or None
+    custom_strategy_name = (body.get("custom_strategy_name") or "").strip() or None
 
     try:
         from services.vectorbt_backtest_service import run_vectorbt_backtest
@@ -324,6 +330,9 @@ def platform_vectorbt_backtest():
             max_hold_days=max_hold,
             data_source=data_source,
             openalgo_api_key=openalgo_api_key or None,
+            entry_conditions=entry_conditions,
+            exit_conditions=exit_conditions,
+            custom_strategy_name=custom_strategy_name,
         )
         return jsonify(out), 200
     except Exception as exc:
