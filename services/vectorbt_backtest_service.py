@@ -1163,17 +1163,17 @@ def run_vectorbt_backtest(
     achieved: bool | Any = False
     reason_str = ""
     if not use_custom:
-    if strategy == "trend_following" and action.upper() == "BUY":
-        achieved = closes[last] > sma20_l and rsi_l > 45
+        if strategy == "trend_following" and action.upper() == "BUY":
+            achieved = closes[last] > sma20_l and rsi_l > 45
             reason_str = (
-            f"Price vs SMA20 / RSI — {'met' if achieved else 'not met'} "
-            f"(close={closes[last]:.2f}, SMA20={sma20_l:.2f}, RSI={rsi_l:.1f})"
-        )
-    elif strategy == "trend_following":
-        achieved = closes[last] < sma20_l and rsi_l < 55
+                f"Price vs SMA20 / RSI — {'met' if achieved else 'not met'} "
+                f"(close={closes[last]:.2f}, SMA20={sma20_l:.2f}, RSI={rsi_l:.1f})"
+            )
+        elif strategy == "trend_following":
+            achieved = closes[last] < sma20_l and rsi_l < 55
             reason_str = "Trend SELL conditions " + ("met" if achieved else "not met")
-    else:
-        achieved = True
+        else:
+            achieved = True
             reason_str = "See full backtest metrics; live filter varies by strategy."
     else:
         # For custom strategies, evaluate conditions at the last bar
