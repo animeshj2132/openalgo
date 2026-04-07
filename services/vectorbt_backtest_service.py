@@ -509,24 +509,34 @@ def _simulate_signals(
     entry_idx = 0
     hold = 0
 
-    def do_exit(i: int, reason: str) -> None:
+    def do_exit(i: int, reason: str, exit_px: float | None = None) -> None:
         nonlocal in_trade
         exits[i] = True
         in_trade = False
-        detailed_trades.append({"entry_idx": entry_idx, "exit_idx": i, "exit_reason": reason})
+        detailed_trades.append({
+            "entry_idx": entry_idx, "exit_idx": i,
+            "exit_reason": reason, "exit_price_override": exit_px,
+        })
 
     for i in range(20, n):
         if in_trade:
-            hold += 1
-            ratio = closes[i] / entry_price if entry_price else 1.0
+            # Don't count the entry bar itself toward hold duration.
+            # e.g. max_hold=1 means "exit 1 bar AFTER entry", not "exit on entry bar".
+            if i > entry_idx:
+                hold += 1
+            # Use daily high/low to check if SL/TP was touched intraday (not just close)
+            low_ratio  = lows[i]  / entry_price if entry_price else 1.0
+            high_ratio = highs[i] / entry_price if entry_price else 1.0
             if action == "BUY":
-                hit_sl, hit_tp = ratio <= sl_m, ratio >= tp_m
+                hit_sl = low_ratio  <= sl_m
+                hit_tp = high_ratio >= tp_m
             else:
-                hit_sl, hit_tp = ratio >= sl_m, ratio <= tp_m
+                hit_sl = high_ratio >= sl_m
+                hit_tp = low_ratio  <= tp_m
             if hit_sl:
-                do_exit(i, "stop_loss")
+                do_exit(i, "stop_loss", exit_px=round(entry_price * sl_m, 6))
             elif hit_tp:
-                do_exit(i, "take_profit")
+                do_exit(i, "take_profit", exit_px=round(entry_price * tp_m, 6))
             elif hold >= max_hold:
                 do_exit(i, "max_hold")
             continue
@@ -633,42 +643,49 @@ def _simulate_custom_signals(
     hold = 0
     peak_price = 0.0
 
-    def do_exit(i: int, reason: str) -> None:
+    def do_exit(i: int, reason: str, exit_px: float | None = None) -> None:
         nonlocal in_trade
         exits[i] = True
         in_trade = False
-        detailed_trades.append({"entry_idx": entry_idx, "exit_idx": i, "exit_reason": reason})
+        detailed_trades.append({
+            "entry_idx": entry_idx, "exit_idx": i,
+            "exit_reason": reason, "exit_price_override": exit_px,
+        })
 
     warmup = 35  # allow indicators to warm up
 
     for i in range(warmup, n):
         if in_trade:
-            hold += 1
-            ratio = closes[i] / entry_price if entry_price else 1.0
+            # Don't count the entry bar itself toward hold duration.
+            if i > entry_idx:
+                hold += 1
+            # Use daily high/low to check if SL/TP was touched intraday (not just close)
+            low_ratio  = lows[i]  / entry_price if entry_price else 1.0
+            high_ratio = highs[i] / entry_price if entry_price else 1.0
             if action == "BUY":
-                hit_sl = ratio <= sl_m
-                hit_tp = ratio >= tp_m
+                hit_sl = low_ratio  <= sl_m
+                hit_tp = high_ratio >= tp_m
                 if trailing_stop:
-                    peak_price = max(peak_price, closes[i])
+                    peak_price = max(peak_price, highs[i])
                     trail_sl = peak_price * (1.0 - trailing_pct / 100.0)
-                    if closes[i] <= trail_sl:
-                        do_exit(i, "trailing_stop")
+                    if lows[i] <= trail_sl:
+                        do_exit(i, "trailing_stop", exit_px=round(trail_sl, 6))
                         continue
             else:
-                hit_sl = ratio >= sl_m
-                hit_tp = ratio <= tp_m
+                hit_sl = high_ratio >= sl_m
+                hit_tp = low_ratio  <= tp_m
                 if trailing_stop:
-                    peak_price = min(peak_price, closes[i])
+                    peak_price = min(peak_price, lows[i])
                     trail_sl = peak_price * (1.0 + trailing_pct / 100.0)
-                    if closes[i] >= trail_sl:
-                        do_exit(i, "trailing_stop")
+                    if highs[i] >= trail_sl:
+                        do_exit(i, "trailing_stop", exit_px=round(trail_sl, 6))
                         continue
 
             if hit_sl:
-                do_exit(i, "stop_loss")
+                do_exit(i, "stop_loss", exit_px=round(entry_price * sl_m, 6))
                 continue
             if hit_tp:
-                do_exit(i, "take_profit")
+                do_exit(i, "take_profit", exit_px=round(entry_price * tp_m, 6))
                 continue
             if hold >= effective_max:
                 do_exit(i, "max_hold")
@@ -756,13 +773,17 @@ def _trade_record_from_indices(
     macd_line: np.ndarray,
     action: str,
     exit_reason: str,
+    exit_price_override: float | None = None,
 ) -> dict[str, Any]:
     """Build one trade dict from bar indices (fees not included in return %)."""
     entry_date = str(c.index[ei].date()) if 0 <= ei < len(c) else "—"
     exit_date = str(c.index[xi].date()) if 0 <= xi < len(c) else "—"
     entry_price_val = float(price.iloc[ei]) if 0 <= ei < len(price) else None
-    exit_price_val = float(price.iloc[xi]) if 0 <= xi < len(price) else None
-    holding_days = (xi - ei) if (0 <= ei < len(c) and 0 <= xi < len(c)) else None
+    # Use the actual SL/TP level when available; fall back to bar close
+    exit_price_val = exit_price_override if exit_price_override is not None else (
+        float(price.iloc[xi]) if 0 <= xi < len(price) else None
+    )
+    holding_days = max(0, xi - ei) if (0 <= ei < len(c) and 0 <= xi < len(c)) else None
     abs_pnl = None
     if entry_price_val is not None and exit_price_val is not None and entry_price_val:
         if action.upper() == "BUY":
@@ -978,6 +999,11 @@ def run_vectorbt_backtest(
         n_trades = len(trades) if hasattr(trades, "__len__") else 0
 
     exit_reason_map: dict[int, str] = {int(d["entry_idx"]): str(d["exit_reason"]) for d in detailed_trades}
+    exit_price_override_map: dict[int, float] = {
+        int(d["entry_idx"]): float(d["exit_price_override"])
+        for d in detailed_trades
+        if d.get("exit_price_override") is not None
+    }
 
     wr = 0.0
     wins = 0
@@ -1005,7 +1031,7 @@ def run_vectorbt_backtest(
                 exit_date = str(c.index[xi].date()) if 0 <= xi < len(c) else "—"
                 entry_price_val = float(price.iloc[ei]) if 0 <= ei < len(price) else None
                 exit_price_val = float(price.iloc[xi]) if 0 <= xi < len(price) else None
-                holding_days = (xi - ei) if (0 <= ei < len(c) and 0 <= xi < len(c)) else None
+                holding_days = max(0, xi - ei) if (0 <= ei < len(c) and 0 <= xi < len(c)) else None
                 abs_pnl = None
                 if entry_price_val is not None and exit_price_val is not None:
                     abs_pnl = round(
@@ -1013,6 +1039,15 @@ def run_vectorbt_backtest(
                         else entry_price_val - exit_price_val, 2
                     )
                 exit_reason = exit_reason_map.get(ei, "unknown")
+                # Use actual SL/TP level as exit price when available (more accurate than bar close)
+                ep_override = exit_price_override_map.get(ei)
+                if ep_override is not None:
+                    exit_price_val = ep_override
+                    if entry_price_val and entry_price_val > 0:
+                        if action.upper() == "BUY":
+                            er = (exit_price_val - entry_price_val) / entry_price_val * 100.0
+                        else:
+                            er = (entry_price_val - exit_price_val) / entry_price_val * 100.0
                 entry_rsi = round(float(rsi_arr[ei]), 2) if 0 <= ei < len(rsi_arr) and not np.isnan(rsi_arr[ei]) else None
                 entry_sma20 = round(float(sma20_arr[ei]), 2) if 0 <= ei < len(sma20_arr) and not np.isnan(sma20_arr[ei]) else None
                 entry_macd = round(float(macd_line[ei]), 4) if 0 <= ei < len(macd_line) and not np.isnan(macd_line[ei]) else None
@@ -1059,6 +1094,7 @@ def run_vectorbt_backtest(
                     sma20_arr, rsi_arr, macd_line,
                     action,
                     str(d.get("exit_reason", "unknown")),
+                    exit_price_override=d.get("exit_price_override"),
                 )
             )
 
