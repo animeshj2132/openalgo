@@ -623,7 +623,10 @@ def _simulate_custom_signals(
     ec_tp = float(exit_conditions.get("takeProfitPct") or 0)
     effective_sl = ec_sl if ec_sl > 0 else sl_pct
     effective_tp = ec_tp if ec_tp > 0 else tp_pct
-    effective_max = int(exit_conditions.get("exitAfterMinutes") or 0) or max_hold  # in bars for daily
+    # exitAfterMinutes is an intraday concept; convert to daily bars (375 min ≈ 1 trading day).
+    # Cap at max_hold so an intraday "exit after 375 min" becomes 1 daily bar, not 375.
+    _exit_minutes = int(exit_conditions.get("exitAfterMinutes") or 0)
+    effective_max = max(1, round(_exit_minutes / 375)) if _exit_minutes > 0 else max_hold
     trailing_stop = bool(exit_conditions.get("trailingStop", False))
     trailing_pct = float(exit_conditions.get("trailingStopPct") or effective_sl)
 
