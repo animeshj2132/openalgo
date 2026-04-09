@@ -1613,6 +1613,9 @@ def run_options_orb_backtest(
     # Risk
     lot_size: int = 1,
     max_premium_per_lot: float = 500.0,
+    # Specific contract (from user selection)
+    options_symbol: str = "",
+    expiry_date: str = "",
 ) -> dict[str, Any]:
     """
     ORB-based options strategy backtest using real intraday 5-minute bars.
@@ -1623,6 +1626,10 @@ def run_options_orb_backtest(
     - Apply SL%, TP%, trailing SL, hard time exit
     - Skip entries on expiry day (expiry_day_guard)
     - Neutral direction trades both CE + PE; bullish=CE only; bearish=PE only
+
+    If options_symbol is provided, the direction is derived from the symbol (CE/PE)
+    and the strike is used for premium estimation. The expiry_date constrains which
+    historical days are considered for simulation.
 
     Returns a payload matching the existing BacktestResult shape so the UI renders
     it in the same panel as equity/algo backtests.
@@ -1637,6 +1644,24 @@ def run_options_orb_backtest(
     sym = symbol.strip().upper()
     ex = (exchange or "NFO").strip().upper()
 
+    # ── Parse options_symbol to derive direction + strike ──────────────────
+    opt_sym = (options_symbol or "").strip().upper()
+    # Derive direction from CE/PE suffix (overrides trade_direction param)
+    if opt_sym.endswith("CE"):
+        effective_direction = "bullish"
+    elif opt_sym.endswith("PE"):
+        effective_direction = "bearish"
+    else:
+        effective_direction = trade_direction  # keep user-set direction if no suffix
+
+    # Parse the expiry date to use as an upper bound for simulation
+    expiry_dt: dt.date | None = None
+    if expiry_date:
+        try:
+            expiry_dt = dt.date.fromisoformat(expiry_date[:10])
+        except ValueError:
+            expiry_dt = None
+
     # Load 5-min bars
     df = _load_5m_bars_for_underlying(sym, ex, days, openalgo_api_key)
     if df.empty:
@@ -1648,6 +1673,10 @@ def run_options_orb_backtest(
     simulated_dates: list[str] = []
 
     for day_date, group in df.groupby("date_key"):
+        # If expiry_date provided, only simulate days up to and including that expiry
+        if expiry_dt is not None and day_date > expiry_dt:
+            continue
+
         date_str = str(day_date)
         simulated_dates.append(date_str)
 
@@ -1662,7 +1691,7 @@ def run_options_orb_backtest(
             min_range_pct=min_range_pct,
             max_range_pct=max_range_pct,
             momentum_bars=momentum_bars,
-            trade_direction=trade_direction,
+            trade_direction=effective_direction,
             sl_pct=sl_pct,
             tp_pct=tp_pct,
             trailing_enabled=trailing_enabled,
@@ -1794,7 +1823,7 @@ def run_options_orb_backtest(
             "min_range_pct": min_range_pct,
             "max_range_pct": max_range_pct,
             "momentum_bars": momentum_bars,
-            "trade_direction": trade_direction,
+            "trade_direction": effective_direction,
             "expiry_type": expiry_type,
             "expiry_day_guard": expiry_day_guard,
             "sl_pct": sl_pct,
@@ -1804,6 +1833,9 @@ def run_options_orb_backtest(
             "trail_pct": trail_pct,
             "time_exit_hhmm": time_exit_hhmm,
             "max_reentry_count": max_reentry_count,
+            "options_symbol": opt_sym,
+            "expiry_date": expiry_date,
+            "lot_size": lot_size,
         },
         # Core metrics (same field names as run_vectorbt_backtest)
         "totalTrades": n_trades,

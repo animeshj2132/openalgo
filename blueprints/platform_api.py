@@ -351,7 +351,7 @@ def platform_vectorbt_backtest():
 
             out = run_options_orb_backtest(
                 symbol=symbol,
-                exchange=exchange or "NFO",
+                exchange=exchange or "NSE",
                 days=days,
                 openalgo_api_key=openalgo_api_key or None,
                 orb_duration_mins=_i("orb_duration_mins", 15),
@@ -370,6 +370,8 @@ def platform_vectorbt_backtest():
                 max_reentry_count=_i("max_reentry_count", 1),
                 lot_size=_i("lot_size", 1),
                 max_premium_per_lot=_f("max_premium_per_lot", 500.0),
+                options_symbol=_s("options_symbol", ""),
+                expiry_date=_s("expiry_date", ""),
             )
         else:
             # ── Standard VectorBT equity/index backtest ───────────────────────
