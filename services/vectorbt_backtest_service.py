@@ -1493,38 +1493,33 @@ def _simulate_orb_options_day(
             pnl_pct = (current_premium - entry_premium) / entry_premium * 100.0 if entry_premium > 0 else 0.0
             peak_pnl_pct = (peak_premium - entry_premium) / entry_premium * 100.0 if entry_premium > 0 else 0.0
 
-            # Hard time exit
-            if t_str >= exit_str:
+            def _append(reason: str, fin_pnl_pct: float) -> None:
                 results.append({
                     "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
-                    "direction": direction, "exit_reason": "TIME",
-                    "pnl_pct": round(pnl_pct, 2), "entry_price": entry_price,
+                    "direction": direction, "exit_reason": reason,
+                    "pnl_pct": round(fin_pnl_pct, 2),
+                    "entry_price": entry_price,
+                    "entry_premium": round(entry_premium, 2),
                     "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
                 })
+
+            # Hard time exit
+            if t_str >= exit_str:
+                _append("TIME", pnl_pct)
                 in_trade = False
                 reentry_count += 1
                 continue
 
             # SL
             if pnl_pct <= -sl_pct:
-                results.append({
-                    "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
-                    "direction": direction, "exit_reason": "SL",
-                    "pnl_pct": round(-sl_pct, 2), "entry_price": entry_price,
-                    "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
-                })
+                _append("SL", -sl_pct)
                 in_trade = False
                 reentry_count += 1
                 continue
 
             # TP
             if pnl_pct >= tp_pct:
-                results.append({
-                    "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
-                    "direction": direction, "exit_reason": "TP",
-                    "pnl_pct": round(tp_pct, 2), "entry_price": entry_price,
-                    "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
-                })
+                _append("TP", tp_pct)
                 in_trade = False
                 reentry_count += 1
                 continue
@@ -1535,12 +1530,7 @@ def _simulate_orb_options_day(
             if trail_activated:
                 trail_sl_pct = peak_pnl_pct - trail_pct
                 if pnl_pct <= trail_sl_pct:
-                    results.append({
-                        "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
-                        "direction": direction, "exit_reason": "TRAIL",
-                        "pnl_pct": round(pnl_pct, 2), "entry_price": entry_price,
-                        "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
-                    })
+                    _append("TRAIL", pnl_pct)
                     in_trade = False
                     reentry_count += 1
                     continue
@@ -1593,6 +1583,7 @@ def _simulate_orb_options_day(
             "entry_hhmm": entry_hhmm, "exit_hhmm": _ist_hhmm_from_ts(last["dt"]),
             "direction": direction, "exit_reason": "TIME",
             "pnl_pct": round(pnl_pct, 2), "entry_price": entry_price,
+            "entry_premium": round(entry_premium, 2),
             "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
         })
 
@@ -1734,17 +1725,49 @@ def run_options_orb_backtest(
 
     # ── Aggregate ───────────────────────────────────────────────────────────────
 
+    def _hhmm_to_frac_day(hhmm: str) -> float:
+        """Convert HH:MM string to fraction of day (e.g. '10:30' → 0.4375)."""
+        try:
+            h, m = map(int, hhmm.split(":"))
+            return (h * 60 + m) / (24 * 60)
+        except Exception:
+            return 0.0
+
+    # One lot unit for this underlying (used for abs PnL calc)
+    _LOT_UNITS: dict[str, int] = {
+        "NIFTY": 75, "BANKNIFTY": 15, "FINNIFTY": 40,
+        "MIDCPNIFTY": 50, "NIFTYNXT50": 25, "SENSEX": 10,
+        "BANKEX": 15,
+    }
+    _lot_units = _LOT_UNITS.get(sym, 75)
+
+    # Premium proxy: entry_price is the underlying price at breakout.
+    # ATM option premium ≈ 0.5–1% of underlying for near-month options.
+    # We use the simulated pnl_pct * entry_premium as rupee PnL.
+    # entry_premium is stored in the raw trade dict from _simulate_orb_options_day.
+
     trades_list: list[dict[str, Any]] = []
     for k, t in enumerate(all_trades_raw):
+        entry_premium = float(t.get("entry_premium", t["entry_price"] * 0.008))
+        exit_premium = entry_premium * (1 + float(t["pnl_pct"]) / 100.0)
+        abs_pnl = round((exit_premium - entry_premium) * _lot_units * lot_size, 2)
+
+        # Holding duration in fractional days (intraday → typically 0.01–0.3)
+        entry_frac = _hhmm_to_frac_day(t.get("entry_hhmm", "09:30"))
+        exit_frac = _hhmm_to_frac_day(t.get("exit_hhmm", "15:15"))
+        holding_frac = max(0.0, round(exit_frac - entry_frac, 4))  # always same day
+
         trades_list.append({
             "tradeNo": k + 1,
             "entryDate": t["date"],
             "exitDate": t["date"],
-            "entryPrice": round(float(t["entry_price"]), 2),
-            "exitPrice": None,
-            "holdingDays": 0,
+            "entryTime": t.get("entry_hhmm", ""),
+            "exitTime": t.get("exit_hhmm", ""),
+            "entryPrice": round(entry_premium, 2),
+            "exitPrice": round(exit_premium, 2),
+            "holdingDays": holding_frac,   # fractional day e.g. 0.23
             "returnPct": round(float(t["pnl_pct"]), 2),
-            "absPnl": None,
+            "absPnl": abs_pnl,
             "profitable": t["pnl_pct"] > 0,
             "exitReason": t["exit_reason"].lower(),
             "entryRsi": None,
@@ -1752,13 +1775,14 @@ def run_options_orb_backtest(
             "entryMacd": None,
             "exitRsi": None,
             "candles": [],
-            # Options-specific extras
+            # Options-specific extras (for display in trade log)
             "direction": t["direction"],
-            "entry_hhmm": t["entry_hhmm"],
-            "exit_hhmm": t["exit_hhmm"],
+            "entry_hhmm": t.get("entry_hhmm", ""),
+            "exit_hhmm": t.get("exit_hhmm", ""),
             "orb_high": round(float(t["orb_high"]), 2),
             "orb_low": round(float(t["orb_low"]), 2),
             "range_pct": round(float(t["range_pct"]), 2),
+            "underlying_entry": round(float(t["entry_price"]), 2),
         })
 
     n_trades = len(trades_list)
@@ -1766,7 +1790,9 @@ def run_options_orb_backtest(
     losses = n_trades - wins
     wr = (wins / n_trades * 100.0) if n_trades else 0.0
     rets = [t["returnPct"] for t in trades_list]
+    abs_pnls = [t["absPnl"] for t in trades_list if t["absPnl"] is not None]
     total_return = round(sum(rets), 2)
+    total_abs_pnl = round(sum(abs_pnls), 2) if abs_pnls else 0.0
     win_rets = [r for r in rets if r > 0]
     loss_rets = [r for r in rets if r <= 0]
     avg_win = round(sum(win_rets) / len(win_rets), 2) if win_rets else 0.0
@@ -1775,6 +1801,10 @@ def run_options_orb_backtest(
     gross_win = sum(win_rets)
     gross_loss = abs(sum(loss_rets))
     profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+
+    # Average holding in fractional days
+    holds = [t["holdingDays"] for t in trades_list if t["holdingDays"] is not None]
+    avg_hold = round(sum(holds) / len(holds), 4) if holds else 0.0
 
     # Max drawdown on cumulative premium PnL
     peak_cum = cum = max_dd = 0.0
@@ -1795,6 +1825,18 @@ def run_options_orb_backtest(
         max_win_streak = max(max_win_streak, cur_w)
         max_loss_streak = max(max_loss_streak, cur_l)
 
+    # Sharpe ratio on daily trade returns (intraday — treat each trade as one obs)
+    import statistics as _stats
+    if len(rets) >= 2:
+        try:
+            std_r = _stats.stdev(rets)
+            mean_r = _stats.mean(rets)
+            sharpe = round((mean_r / std_r) * (252 ** 0.5) if std_r > 0 else 0.0, 3)
+        except Exception:
+            sharpe = 0.0
+    else:
+        sharpe = 0.0
+
     exit_reason_counts: dict[str, int] = {}
     for t in trades_list:
         reason = t.get("exitReason", "unknown")
@@ -1806,6 +1848,15 @@ def run_options_orb_backtest(
     for t in trades_list:
         cum_pnl += t["returnPct"]
         equity_curve.append({"date": t["entryDate"], "value": round(cum_pnl, 2)})
+
+    # Daily returns — one row per unique date (sum of all trades that day)
+    daily_ret_map: dict[str, float] = {}
+    for t in trades_list:
+        daily_ret_map[t["entryDate"]] = daily_ret_map.get(t["entryDate"], 0.0) + t["returnPct"]
+    daily_returns = [
+        {"date": d, "returnPct": round(v, 4)}
+        for d, v in sorted(daily_ret_map.items())
+    ]
 
     # Historical snapshots
     historical_snapshots: list[dict[str, Any]] = []
@@ -1825,6 +1876,8 @@ def run_options_orb_backtest(
                 continue
             w_rets = [t["returnPct"] for t in window]
             w_wins = sum(1 for r in w_rets if r > 0)
+            w_holds = [float(t["holdingDays"]) for t in window if t.get("holdingDays") is not None]
+            w_avg_hold = round(sum(w_holds) / len(w_holds), 4) if w_holds else 0.0
             historical_snapshots.append({
                 "label": _lookback_label(lookback), "lookbackDays": lookback,
                 "trades": len(window), "wins": w_wins, "losses": len(window) - w_wins,
@@ -1832,7 +1885,7 @@ def run_options_orb_backtest(
                 "totalReturn": round(sum(w_rets), 2),
                 "bestTrade": round(max(w_rets), 2),
                 "worstTrade": round(min(w_rets), 2),
-                "avgHoldingDays": 0.0,
+                "avgHoldingDays": w_avg_hold,
                 "equityCurveSlice": [e for e in equity_curve if e["date"] >= cutoff],
             })
 
@@ -1871,13 +1924,14 @@ def run_options_orb_backtest(
         "losses": losses,
         "winRate": round(wr, 2),
         "totalReturn": total_return,
+        "totalAbsPnl": total_abs_pnl,
         "avgReturn": round(total_return / n_trades, 4) if n_trades else 0.0,
         "maxDrawdown": round(max_dd, 2),
         "profitFactor": profit_factor if profit_factor is not None else 0.0,
-        "sharpeRatio": 0.0,  # not meaningful for premium % trades
+        "sharpeRatio": sharpe,
         "bestTrade": round(max(rets), 2) if rets else 0.0,
         "worstTrade": round(min(rets), 2) if rets else 0.0,
-        "avgHoldingDays": 0.0,
+        "avgHoldingDays": avg_hold,  # fractional day (intraday ~0.1–0.3)
         "avgWin": avg_win,
         "avgLoss": avg_loss,
         "expectancy": expectancy,
@@ -1887,7 +1941,7 @@ def run_options_orb_backtest(
         "sampleTrades": trades_list[:8],
         "trades": trades_list,
         "equityCurve": equity_curve,
-        "dailyReturns": [],
+        "dailyReturns": daily_returns,
         "historicalSnapshots": historical_snapshots,
         "strategyAchieved": False,
         "achievementReason": "Options ORB backtest — live check not applicable.",
