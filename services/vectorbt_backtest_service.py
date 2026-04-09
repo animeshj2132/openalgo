@@ -1353,14 +1353,25 @@ def _load_5m_bars_for_underlying(
         api_key=openalgo_api_key, source="api",
     )
     if not ok:
+        broker_msg = ""
+        if isinstance(payload, dict):
+            broker_msg = payload.get("message") or payload.get("error") or payload.get("status") or ""
         raise RuntimeError(
-            f"Failed to fetch 5-min history for {symbol} ({exchange}). "
-            "Ensure OpenAlgo is connected to your broker and history is available."
+            f"Failed to fetch 5-min history for {symbol} ({exchange})"
+            + (f": {broker_msg}" if broker_msg else "") +
+            ". Ensure OpenAlgo is running, your broker is connected, "
+            "and intraday history is available for this symbol."
         )
 
     raw = payload.get("data") if isinstance(payload, dict) else payload
     if not raw or not isinstance(raw, list):
-        raise RuntimeError(f"Empty 5-min history for {symbol}. Check broker connection.")
+        broker_msg = payload.get("message", "") if isinstance(payload, dict) else ""
+        raise RuntimeError(
+            f"No 5-min bars returned for {symbol} ({exchange})"
+            + (f": {broker_msg}" if broker_msg else "") +
+            ". The broker returned an empty history — market may be closed "
+            "or this symbol has no intraday data for the requested period."
+        )
 
     rows = []
     for r in raw:
@@ -1642,7 +1653,24 @@ def run_options_orb_backtest(
 
     days = max(10, min(int(days), 365))
     sym = symbol.strip().upper()
-    ex = (exchange or "NFO").strip().upper()
+    ex = (exchange or "NSE").strip().upper()
+
+    # ── Auto-correct exchange for index underlyings ─────────────────────────
+    # Indices like NIFTY, BANKNIFTY, FINNIFTY, SENSEX, MIDCPNIFTY require
+    # NSE_INDEX / BSE_INDEX — not NSE/BSE — for intraday history.
+    _NSE_INDICES = {
+        "NIFTY", "NIFTY50", "NIFTY 50",
+        "BANKNIFTY", "BANK NIFTY",
+        "FINNIFTY", "FIN NIFTY",
+        "MIDCPNIFTY", "MIDCAP NIFTY",
+        "NIFTYNXT50",
+    }
+    _BSE_INDICES = {"SENSEX", "BANKEX"}
+
+    if sym in _NSE_INDICES and ex in ("NSE", "NFO"):
+        ex = "NSE_INDEX"
+    elif sym in _BSE_INDICES and ex in ("BSE", "BFO"):
+        ex = "BSE_INDEX"
 
     # ── Parse options_symbol to derive direction + strike ──────────────────
     opt_sym = (options_symbol or "").strip().upper()
@@ -1814,7 +1842,7 @@ def run_options_orb_backtest(
         "backtestPeriod": f"{len(simulated_dates)} trading days ({days}d lookback)",
         "data_source": "broker_5m_bars",
         "symbol": sym,
-        "exchange": ex,
+        "exchange": ex,  # corrected (e.g. NSE_INDEX for NIFTY)
         "strategy": "options_orb",
         "usedCustomConditions": False,
         "isOptionsBacktest": True,
