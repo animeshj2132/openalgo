@@ -1297,3 +1297,540 @@ def run_vectorbt_backtest(
         },
     }
     return _json_sanitize(payload)
+
+
+# ─── Options ORB Strategy Backtest ───────────────────────────────────────────
+
+
+def _ist_hhmm_from_ts(ts: pd.Timestamp) -> str:
+    """Convert a pandas Timestamp (already IST) to HH:MM string."""
+    return f"{ts.hour:02d}:{ts.minute:02d}"
+
+
+def _weekly_expiry_dow(underlying: str) -> int:
+    """0=Mon … 6=Sun (pandas convention). Thursday=3 for NIFTY etc."""
+    u = underlying.upper()
+    if u == "BANKNIFTY":
+        return 2  # Wednesday
+    if u == "FINNIFTY":
+        return 1  # Tuesday
+    return 3  # Thursday — NIFTY, MIDCPNIFTY, SENSEX, others
+
+
+def _is_expiry_day(date: dt.date, underlying: str, expiry_type: str) -> bool:
+    """True if `date` is a weekly or monthly expiry day for the underlying."""
+    dow = date.weekday()  # 0=Mon … 6=Sun
+    if expiry_type == "weekly":
+        return dow == _weekly_expiry_dow(underlying)
+    # monthly: last Thursday (or last Wed for BANKNIFTY) of the month
+    expiry_dow = _weekly_expiry_dow(underlying)
+    # Is today the target weekday AND within last 7 days of month?
+    if dow != expiry_dow:
+        return False
+    import calendar
+    last_day = calendar.monthrange(date.year, date.month)[1]
+    return date.day >= last_day - 6
+
+
+def _load_5m_bars_for_underlying(
+    symbol: str,
+    exchange: str,
+    days: int,
+    openalgo_api_key: str,
+) -> pd.DataFrame:
+    """
+    Fetch intraday 5-minute OHLCV bars from broker via get_history.
+    Returns a DataFrame with columns: timestamp (pd.Timestamp IST), open, high, low, close.
+    """
+    ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    now_ist = dt.datetime.now(ist)
+    end_date = now_ist.strftime("%Y-%m-%d")
+    start_date = (now_ist - dt.timedelta(days=days + 5)).strftime("%Y-%m-%d")
+
+    ok, payload, _status = get_history(
+        symbol=symbol, exchange=exchange, interval="5m",
+        start_date=start_date, end_date=end_date,
+        api_key=openalgo_api_key, source="api",
+    )
+    if not ok:
+        raise RuntimeError(
+            f"Failed to fetch 5-min history for {symbol} ({exchange}). "
+            "Ensure OpenAlgo is connected to your broker and history is available."
+        )
+
+    raw = payload.get("data") if isinstance(payload, dict) else payload
+    if not raw or not isinstance(raw, list):
+        raise RuntimeError(f"Empty 5-min history for {symbol}. Check broker connection.")
+
+    rows = []
+    for r in raw:
+        if isinstance(r, dict):
+            rows.append(r)
+        elif isinstance(r, (list, tuple)) and len(r) >= 5:
+            # [timestamp, open, high, low, close, ...]
+            rows.append({
+                "timestamp": r[0], "open": r[1], "high": r[2],
+                "low": r[3], "close": r[4],
+            })
+
+    if not rows:
+        raise RuntimeError(f"Could not parse 5-min bars for {symbol}.")
+
+    df = pd.DataFrame(rows)
+    # Normalise columns
+    df.columns = [c.lower() for c in df.columns]
+    if "timestamp" not in df.columns:
+        for alt in ("datetime", "date", "time"):
+            if alt in df.columns:
+                df.rename(columns={alt: "timestamp"}, inplace=True)
+                break
+
+    ts_col = df["timestamp"]
+    if pd.api.types.is_numeric_dtype(ts_col):
+        # epoch seconds or ms
+        unit = "ms" if ts_col.max() > 1e12 else "s"
+        df["dt"] = pd.to_datetime(ts_col, unit=unit, utc=True).dt.tz_convert("Asia/Kolkata")
+    else:
+        df["dt"] = pd.to_datetime(ts_col, utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata")
+        if df["dt"].isna().all():
+            df["dt"] = pd.to_datetime(ts_col, errors="coerce").dt.tz_localize("Asia/Kolkata", ambiguous="infer", nonexistent="shift_forward")
+
+    df = df.dropna(subset=["dt"]).copy()
+    for col in ("open", "high", "low", "close"):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    df = df[df["close"] > 0].sort_values("dt").reset_index(drop=True)
+    return df
+
+
+def _simulate_orb_options_day(
+    day_bars: pd.DataFrame,
+    orb_duration_mins: int,
+    min_range_pct: float,
+    max_range_pct: float,
+    momentum_bars: int,
+    trade_direction: str,
+    sl_pct: float,
+    tp_pct: float,
+    trailing_enabled: bool,
+    trail_after_pct: float,
+    trail_pct: float,
+    time_exit_hhmm: str,
+    max_reentry_count: int,
+) -> list[dict[str, Any]]:
+    """Simulate one trading day using ORB logic on 5-min bars. Returns list of trade dicts."""
+    results: list[dict[str, Any]] = []
+
+    # IST market open is 09:15 IST; ORB window ends at 09:15 + duration
+    orb_end_h = 9
+    orb_end_m = 15 + orb_duration_mins
+    if orb_end_m >= 60:
+        orb_end_h += orb_end_m // 60
+        orb_end_m = orb_end_m % 60
+    orb_end_str = f"{orb_end_h:02d}:{orb_end_m:02d}"
+
+    exit_str = time_exit_hhmm or "15:15"
+
+    orb_bars = day_bars[
+        day_bars["dt"].apply(lambda t: "09:15" <= _ist_hhmm_from_ts(t) < orb_end_str)
+    ]
+    trade_bars = day_bars[
+        day_bars["dt"].apply(lambda t: orb_end_str <= _ist_hhmm_from_ts(t) <= exit_str)
+    ]
+
+    if len(orb_bars) == 0 or len(trade_bars) == 0:
+        return []
+
+    orb_high = float(orb_bars["high"].max())
+    orb_low = float(orb_bars["low"].min())
+    mid = (orb_high + orb_low) / 2.0
+    if mid <= 0:
+        return []
+    range_pct = (orb_high - orb_low) / mid * 100.0
+    if range_pct < min_range_pct or range_pct > max_range_pct:
+        return []
+
+    in_trade = False
+    entry_premium = 0.0
+    peak_premium = 0.0
+    entry_price = 0.0
+    entry_hhmm = ""
+    direction: str = ""
+    trail_activated = False
+    reentry_count = 0
+
+    def can_trade(dir_: str) -> bool:
+        if trade_direction == "bullish" and dir_ != "CE":
+            return False
+        if trade_direction == "bearish" and dir_ != "PE":
+            return False
+        return True
+
+    bars = trade_bars.reset_index(drop=True)
+    n = len(bars)
+
+    for i in range(n):
+        bar = bars.iloc[i]
+        t_str = _ist_hhmm_from_ts(bar["dt"])
+        close = float(bar["close"])
+
+        if in_trade:
+            # ATM premium proxy scales with underlying move
+            current_premium = entry_premium * (close / entry_price) if entry_price > 0 else entry_premium
+            if current_premium > peak_premium:
+                peak_premium = current_premium
+
+            pnl_pct = (current_premium - entry_premium) / entry_premium * 100.0 if entry_premium > 0 else 0.0
+            peak_pnl_pct = (peak_premium - entry_premium) / entry_premium * 100.0 if entry_premium > 0 else 0.0
+
+            # Hard time exit
+            if t_str >= exit_str:
+                results.append({
+                    "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
+                    "direction": direction, "exit_reason": "TIME",
+                    "pnl_pct": round(pnl_pct, 2), "entry_price": entry_price,
+                    "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
+                })
+                in_trade = False
+                reentry_count += 1
+                continue
+
+            # SL
+            if pnl_pct <= -sl_pct:
+                results.append({
+                    "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
+                    "direction": direction, "exit_reason": "SL",
+                    "pnl_pct": round(-sl_pct, 2), "entry_price": entry_price,
+                    "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
+                })
+                in_trade = False
+                reentry_count += 1
+                continue
+
+            # TP
+            if pnl_pct >= tp_pct:
+                results.append({
+                    "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
+                    "direction": direction, "exit_reason": "TP",
+                    "pnl_pct": round(tp_pct, 2), "entry_price": entry_price,
+                    "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
+                })
+                in_trade = False
+                reentry_count += 1
+                continue
+
+            # Trailing SL
+            if trailing_enabled and peak_pnl_pct >= trail_after_pct:
+                trail_activated = True
+            if trail_activated:
+                trail_sl_pct = peak_pnl_pct - trail_pct
+                if pnl_pct <= trail_sl_pct:
+                    results.append({
+                        "entry_hhmm": entry_hhmm, "exit_hhmm": t_str,
+                        "direction": direction, "exit_reason": "TRAIL",
+                        "pnl_pct": round(pnl_pct, 2), "entry_price": entry_price,
+                        "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
+                    })
+                    in_trade = False
+                    reentry_count += 1
+                    continue
+            continue
+
+        # Not in trade — look for breakout
+        if reentry_count > max_reentry_count:
+            break
+
+        breakout_ce = close > orb_high
+        breakout_pe = close < orb_low
+        if not breakout_ce and not breakout_pe:
+            continue
+
+        dir_ = "CE" if breakout_ce else "PE"
+        if not can_trade(dir_):
+            continue
+
+        # Momentum check
+        start_i = max(0, i - momentum_bars + 1)
+        mom_bars = bars.iloc[start_i: i + 1]
+        if len(mom_bars) < momentum_bars:
+            continue
+
+        closes_list = mom_bars["close"].tolist()
+        if dir_ == "CE":
+            momentum_ok = all(closes_list[j] > closes_list[j - 1] for j in range(1, len(closes_list)))
+        else:
+            momentum_ok = all(closes_list[j] < closes_list[j - 1] for j in range(1, len(closes_list)))
+
+        if not momentum_ok:
+            continue
+
+        # Entry: ATM premium ≈ 2.5% of underlying
+        direction = dir_
+        entry_price = close
+        entry_premium = close * 0.025
+        peak_premium = entry_premium
+        entry_hhmm = t_str
+        trail_activated = False
+        in_trade = True
+
+    # Close any still-open trade at end of day
+    if in_trade and n > 0:
+        last = bars.iloc[-1]
+        last_close = float(last["close"])
+        current_premium = entry_premium * (last_close / entry_price) if entry_price > 0 else entry_premium
+        pnl_pct = (current_premium - entry_premium) / entry_premium * 100.0 if entry_premium > 0 else 0.0
+        results.append({
+            "entry_hhmm": entry_hhmm, "exit_hhmm": _ist_hhmm_from_ts(last["dt"]),
+            "direction": direction, "exit_reason": "TIME",
+            "pnl_pct": round(pnl_pct, 2), "entry_price": entry_price,
+            "orb_high": orb_high, "orb_low": orb_low, "range_pct": round(range_pct, 2),
+        })
+
+    return results
+
+
+def run_options_orb_backtest(
+    symbol: str,
+    exchange: str,
+    days: int = 90,
+    openalgo_api_key: str | None = None,
+    # ORB config
+    orb_duration_mins: int = 15,
+    min_range_pct: float = 0.2,
+    max_range_pct: float = 1.0,
+    momentum_bars: int = 3,
+    # Entry conditions
+    trade_direction: str = "neutral",
+    expiry_type: str = "weekly",
+    expiry_day_guard: bool = True,
+    # Exit rules
+    sl_pct: float = 30.0,
+    tp_pct: float = 50.0,
+    trailing_enabled: bool = True,
+    trail_after_pct: float = 30.0,
+    trail_pct: float = 15.0,
+    time_exit_hhmm: str = "15:15",
+    max_reentry_count: int = 1,
+    # Risk
+    lot_size: int = 1,
+    max_premium_per_lot: float = 500.0,
+) -> dict[str, Any]:
+    """
+    ORB-based options strategy backtest using real intraday 5-minute bars.
+
+    Replicates the exact logic in chartmate-monitor/monitor.py:
+    - Build ORB range from first N minutes of session (09:15–09:30 default)
+    - Detect breakout with N consecutive momentum bars
+    - Apply SL%, TP%, trailing SL, hard time exit
+    - Skip entries on expiry day (expiry_day_guard)
+    - Neutral direction trades both CE + PE; bullish=CE only; bearish=PE only
+
+    Returns a payload matching the existing BacktestResult shape so the UI renders
+    it in the same panel as equity/algo backtests.
+    """
+    if not openalgo_api_key:
+        raise RuntimeError(
+            "OpenAlgo API key required for 5-min intraday data. "
+            "Connect your broker in Broker Sync."
+        )
+
+    days = max(10, min(int(days), 365))
+    sym = symbol.strip().upper()
+    ex = (exchange or "NFO").strip().upper()
+
+    # Load 5-min bars
+    df = _load_5m_bars_for_underlying(sym, ex, days, openalgo_api_key)
+    if df.empty:
+        raise RuntimeError(f"No 5-min bars returned for {sym}. Check broker history availability.")
+
+    # Group by IST date
+    df["date_key"] = df["dt"].apply(lambda t: t.date())
+    all_trades_raw: list[dict[str, Any]] = []
+    simulated_dates: list[str] = []
+
+    for day_date, group in df.groupby("date_key"):
+        date_str = str(day_date)
+        simulated_dates.append(date_str)
+
+        # Expiry day guard
+        if expiry_day_guard and _is_expiry_day(day_date, sym, expiry_type):
+            continue
+
+        day_bars = group.sort_values("dt").reset_index(drop=True)
+        day_results = _simulate_orb_options_day(
+            day_bars=day_bars,
+            orb_duration_mins=orb_duration_mins,
+            min_range_pct=min_range_pct,
+            max_range_pct=max_range_pct,
+            momentum_bars=momentum_bars,
+            trade_direction=trade_direction,
+            sl_pct=sl_pct,
+            tp_pct=tp_pct,
+            trailing_enabled=trailing_enabled,
+            trail_after_pct=trail_after_pct,
+            trail_pct=trail_pct,
+            time_exit_hhmm=time_exit_hhmm,
+            max_reentry_count=max_reentry_count,
+        )
+        for t in day_results:
+            t["date"] = date_str
+        all_trades_raw.extend(day_results)
+
+    # ── Aggregate ───────────────────────────────────────────────────────────────
+
+    trades_list: list[dict[str, Any]] = []
+    for k, t in enumerate(all_trades_raw):
+        trades_list.append({
+            "tradeNo": k + 1,
+            "entryDate": t["date"],
+            "exitDate": t["date"],
+            "entryPrice": round(float(t["entry_price"]), 2),
+            "exitPrice": None,
+            "holdingDays": 0,
+            "returnPct": round(float(t["pnl_pct"]), 2),
+            "absPnl": None,
+            "profitable": t["pnl_pct"] > 0,
+            "exitReason": t["exit_reason"].lower(),
+            "entryRsi": None,
+            "entrySma20": None,
+            "entryMacd": None,
+            "exitRsi": None,
+            "candles": [],
+            # Options-specific extras
+            "direction": t["direction"],
+            "entry_hhmm": t["entry_hhmm"],
+            "exit_hhmm": t["exit_hhmm"],
+            "orb_high": round(float(t["orb_high"]), 2),
+            "orb_low": round(float(t["orb_low"]), 2),
+            "range_pct": round(float(t["range_pct"]), 2),
+        })
+
+    n_trades = len(trades_list)
+    wins = sum(1 for t in trades_list if t["profitable"])
+    losses = n_trades - wins
+    wr = (wins / n_trades * 100.0) if n_trades else 0.0
+    rets = [t["returnPct"] for t in trades_list]
+    total_return = round(sum(rets), 2)
+    win_rets = [r for r in rets if r > 0]
+    loss_rets = [r for r in rets if r <= 0]
+    avg_win = round(sum(win_rets) / len(win_rets), 2) if win_rets else 0.0
+    avg_loss = round(sum(loss_rets) / len(loss_rets), 2) if loss_rets else 0.0
+    expectancy = round((wr / 100) * avg_win + (1 - wr / 100) * avg_loss, 2) if rets else 0.0
+    gross_win = sum(win_rets)
+    gross_loss = abs(sum(loss_rets))
+    profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+
+    # Max drawdown on cumulative premium PnL
+    peak_cum = cum = max_dd = 0.0
+    for r in rets:
+        cum += r
+        if cum > peak_cum:
+            peak_cum = cum
+        dd = peak_cum - cum
+        if dd > max_dd:
+            max_dd = dd
+
+    max_win_streak = max_loss_streak = cur_w = cur_l = 0
+    for r in rets:
+        if r > 0:
+            cur_w += 1; cur_l = 0
+        else:
+            cur_l += 1; cur_w = 0
+        max_win_streak = max(max_win_streak, cur_w)
+        max_loss_streak = max(max_loss_streak, cur_l)
+
+    exit_reason_counts: dict[str, int] = {}
+    for t in trades_list:
+        reason = t.get("exitReason", "unknown")
+        exit_reason_counts[reason] = exit_reason_counts.get(reason, 0) + 1
+
+    # Equity curve (cumulative premium PnL %)
+    equity_curve: list[dict[str, Any]] = []
+    cum_pnl = 0.0
+    for t in trades_list:
+        cum_pnl += t["returnPct"]
+        equity_curve.append({"date": t["entryDate"], "value": round(cum_pnl, 2)})
+
+    # Historical snapshots
+    historical_snapshots: list[dict[str, Any]] = []
+    if trades_list:
+        all_dates = sorted(set(t["entryDate"] for t in trades_list))
+        now_date = dt.date.today()
+        for lookback in [7, 30, 90, 180, 365]:
+            cutoff = str(now_date - dt.timedelta(days=lookback))
+            window = [t for t in trades_list if t["entryDate"] >= cutoff]
+            if not window:
+                historical_snapshots.append({
+                    "label": _lookback_label(lookback), "lookbackDays": lookback,
+                    "trades": 0, "wins": 0, "losses": 0, "winRate": 0.0,
+                    "totalReturn": 0.0, "bestTrade": 0.0, "worstTrade": 0.0,
+                    "avgHoldingDays": 0.0, "equityCurveSlice": [],
+                })
+                continue
+            w_rets = [t["returnPct"] for t in window]
+            w_wins = sum(1 for r in w_rets if r > 0)
+            historical_snapshots.append({
+                "label": _lookback_label(lookback), "lookbackDays": lookback,
+                "trades": len(window), "wins": w_wins, "losses": len(window) - w_wins,
+                "winRate": round(w_wins / len(window) * 100, 1),
+                "totalReturn": round(sum(w_rets), 2),
+                "bestTrade": round(max(w_rets), 2),
+                "worstTrade": round(min(w_rets), 2),
+                "avgHoldingDays": 0.0,
+                "equityCurveSlice": [e for e in equity_curve if e["date"] >= cutoff],
+            })
+
+    payload: dict[str, Any] = {
+        "engine": "options_orb",
+        "action": "BUY",
+        "backtestPeriod": f"{len(simulated_dates)} trading days ({days}d lookback)",
+        "data_source": "broker_5m_bars",
+        "symbol": sym,
+        "exchange": ex,
+        "strategy": "options_orb",
+        "usedCustomConditions": False,
+        "isOptionsBacktest": True,
+        "optionsConfig": {
+            "orb_duration_mins": orb_duration_mins,
+            "min_range_pct": min_range_pct,
+            "max_range_pct": max_range_pct,
+            "momentum_bars": momentum_bars,
+            "trade_direction": trade_direction,
+            "expiry_type": expiry_type,
+            "expiry_day_guard": expiry_day_guard,
+            "sl_pct": sl_pct,
+            "tp_pct": tp_pct,
+            "trailing_enabled": trailing_enabled,
+            "trail_after_pct": trail_after_pct,
+            "trail_pct": trail_pct,
+            "time_exit_hhmm": time_exit_hhmm,
+            "max_reentry_count": max_reentry_count,
+        },
+        # Core metrics (same field names as run_vectorbt_backtest)
+        "totalTrades": n_trades,
+        "wins": wins,
+        "losses": losses,
+        "winRate": round(wr, 2),
+        "totalReturn": total_return,
+        "avgReturn": round(total_return / n_trades, 4) if n_trades else 0.0,
+        "maxDrawdown": round(max_dd, 2),
+        "profitFactor": profit_factor if profit_factor is not None else 0.0,
+        "sharpeRatio": 0.0,  # not meaningful for premium % trades
+        "bestTrade": round(max(rets), 2) if rets else 0.0,
+        "worstTrade": round(min(rets), 2) if rets else 0.0,
+        "avgHoldingDays": 0.0,
+        "avgWin": avg_win,
+        "avgLoss": avg_loss,
+        "expectancy": expectancy,
+        "maxWinStreak": max_win_streak,
+        "maxLossStreak": max_loss_streak,
+        "exitReasonCounts": exit_reason_counts,
+        "sampleTrades": trades_list[:8],
+        "trades": trades_list,
+        "equityCurve": equity_curve,
+        "dailyReturns": [],
+        "historicalSnapshots": historical_snapshots,
+        "strategyAchieved": False,
+        "achievementReason": "Options ORB backtest — live check not applicable.",
+        "currentIndicators": {},
+    }
+    return _json_sanitize(payload)

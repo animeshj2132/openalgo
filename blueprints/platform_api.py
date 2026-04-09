@@ -325,24 +325,72 @@ def platform_vectorbt_backtest():
             execution_days = None
 
     try:
-        from services.vectorbt_backtest_service import run_vectorbt_backtest
+        if strategy == "options_orb":
+            # ── Options ORB backtest ──────────────────────────────────────────
+            from services.vectorbt_backtest_service import run_options_orb_backtest
 
-        out = run_vectorbt_backtest(
-            symbol=symbol,
-            exchange=exchange,
-            strategy=strategy,
-            action=action,
-            days=days,
-            stop_loss_pct=sl,
-            take_profit_pct=tp,
-            max_hold_days=max_hold,
-            data_source=data_source,
-            openalgo_api_key=openalgo_api_key or None,
-            entry_conditions=entry_conditions,
-            exit_conditions=exit_conditions,
-            custom_strategy_name=custom_strategy_name,
-            execution_days=execution_days,
-        )
+            opts = body.get("options_config") or {}
+
+            def _f(k: str, default: float) -> float:
+                return float(opts.get(k) or body.get(k) or default)
+
+            def _i(k: str, default: int) -> int:
+                return int(opts.get(k) or body.get(k) or default)
+
+            def _b(k: str, default: bool) -> bool:
+                v = opts.get(k)
+                if v is None:
+                    v = body.get(k)
+                if v is None:
+                    return default
+                return bool(v)
+
+            def _s(k: str, default: str) -> str:
+                v = opts.get(k) or body.get(k)
+                return str(v).strip() if v is not None else default
+
+            out = run_options_orb_backtest(
+                symbol=symbol,
+                exchange=exchange or "NFO",
+                days=days,
+                openalgo_api_key=openalgo_api_key or None,
+                orb_duration_mins=_i("orb_duration_mins", 15),
+                min_range_pct=_f("min_range_pct", 0.2),
+                max_range_pct=_f("max_range_pct", 1.0),
+                momentum_bars=_i("momentum_bars", 3),
+                trade_direction=_s("trade_direction", "neutral"),
+                expiry_type=_s("expiry_type", "weekly"),
+                expiry_day_guard=_b("expiry_day_guard", True),
+                sl_pct=_f("sl_pct", sl * 10),  # equity SL 2% → options 20%
+                tp_pct=_f("tp_pct", tp * 10),  # equity TP 4% → options 40%
+                trailing_enabled=_b("trailing_enabled", True),
+                trail_after_pct=_f("trail_after_pct", 30.0),
+                trail_pct=_f("trail_pct", 15.0),
+                time_exit_hhmm=_s("time_exit_hhmm", "15:15"),
+                max_reentry_count=_i("max_reentry_count", 1),
+                lot_size=_i("lot_size", 1),
+                max_premium_per_lot=_f("max_premium_per_lot", 500.0),
+            )
+        else:
+            # ── Standard VectorBT equity/index backtest ───────────────────────
+            from services.vectorbt_backtest_service import run_vectorbt_backtest
+
+            out = run_vectorbt_backtest(
+                symbol=symbol,
+                exchange=exchange,
+                strategy=strategy,
+                action=action,
+                days=days,
+                stop_loss_pct=sl,
+                take_profit_pct=tp,
+                max_hold_days=max_hold,
+                data_source=data_source,
+                openalgo_api_key=openalgo_api_key or None,
+                entry_conditions=entry_conditions,
+                exit_conditions=exit_conditions,
+                custom_strategy_name=custom_strategy_name,
+                execution_days=execution_days,
+            )
         return jsonify(out), 200
     except Exception as exc:
         logger.exception(f"platform_api vectorbt-backtest failed: {exc}")
