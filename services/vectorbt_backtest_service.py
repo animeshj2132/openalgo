@@ -25,8 +25,38 @@ import pandas as pd
 
 from database.historify_db import get_ohlcv
 from services.history_service import get_history
+from services.algo_guide_preset_backtest import (
+    PRESET_INTERVAL_MAP,
+    extract_algo_guide_preset,
+    get_preset_params,
+    run_preset_signals,
+)
 
 logger = logging.getLogger(__name__)
+
+_YF_INTERVAL_MAP: dict[str, str] = {
+    "1m": "1m",
+    "2m": "2m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "60m": "60m",
+    "1h": "60m",
+    "D": "1d",
+    "1d": "1d",
+}
+
+_INTERVAL_FREQ_MAP: dict[str, str] = {
+    "1m": "1min",
+    "2m": "2min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "60m": "1h",
+    "1h": "1h",
+    "D": "1D",
+    "1d": "1D",
+}
 
 
 def _json_sanitize(obj: Any) -> Any:
@@ -197,6 +227,188 @@ def _load_ohlc(
         raise RuntimeError(
             f"No historical data for {sym} on {ex}. "
             "Use OpenAlgo Historify to download bars, or use a liquid NSE/BSE equity symbol."
+        ) from e
+
+
+def _parse_ohlcv_df(
+    df: pd.DataFrame, interval: str, days: int
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+    if df is None or df.empty:
+        raise RuntimeError("No data rows found for requested interval.")
+    frame = df.copy()
+    frame.columns = [str(c).lower() for c in frame.columns]
+    if "timestamp" not in frame.columns:
+        if "datetime" in frame.columns:
+            ts = pd.to_datetime(frame["datetime"], errors="coerce", utc=True)
+            frame["timestamp"] = (ts.astype("int64") // 10**9).astype("int64")
+        elif "date" in frame.columns:
+            ts = pd.to_datetime(frame["date"], errors="coerce", utc=True)
+            frame["timestamp"] = (ts.astype("int64") // 10**9).astype("int64")
+    if "timestamp" not in frame.columns:
+        raise RuntimeError("OHLCV payload has no timestamp column.")
+
+    ts_col = frame["timestamp"]
+    if pd.api.types.is_numeric_dtype(ts_col):
+        unit = "ms" if float(ts_col.max()) > 1e12 else "s"
+        idx = pd.to_datetime(ts_col, unit=unit, utc=True, errors="coerce")
+    else:
+        idx = pd.to_datetime(ts_col, utc=True, errors="coerce")
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    idx = idx.tz_convert("Asia/Kolkata")
+
+    is_daily = str(interval).lower() in {"d", "1d"}
+    if is_daily:
+        idx = idx.normalize()
+
+    frame["open"] = pd.to_numeric(frame.get("open", 0.0), errors="coerce")
+    frame["high"] = pd.to_numeric(frame.get("high", 0.0), errors="coerce")
+    frame["low"] = pd.to_numeric(frame.get("low", 0.0), errors="coerce")
+    frame["close"] = pd.to_numeric(frame.get("close", 0.0), errors="coerce")
+    frame["volume"] = pd.to_numeric(frame.get("volume", 0.0), errors="coerce").fillna(0.0)
+
+    close = pd.Series(frame["close"].values, index=idx, name="close")
+    high = pd.Series(frame["high"].values, index=idx, name="high")
+    low = pd.Series(frame["low"].values, index=idx, name="low")
+    open_ = pd.Series(frame["open"].values, index=idx, name="open")
+    vol = pd.Series(frame["volume"].values, index=idx, name="volume")
+
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+    high = high.reindex(close.index).ffill().fillna(close)
+    low = low.reindex(close.index).ffill().fillna(close)
+    open_ = open_.reindex(close.index).ffill().fillna(close)
+    vol = vol.reindex(close.index).fillna(0.0)
+
+    if is_daily:
+        tail = close.iloc[-days:]
+        return tail, high.loc[tail.index], low.loc[tail.index], open_.loc[tail.index], vol.loc[tail.index]
+
+    cutoff = close.index.max() - pd.Timedelta(days=max(2, int(days)))
+    mask = close.index >= cutoff
+    close_t = close.loc[mask]
+    if close_t.empty:
+        close_t = close.iloc[-min(len(close), 500):]
+    return (
+        close_t,
+        high.loc[close_t.index],
+        low.loc[close_t.index],
+        open_.loc[close_t.index],
+        vol.loc[close_t.index],
+    )
+
+
+def _load_ohlcv_with_interval(
+    symbol: str,
+    exchange: str,
+    days: int,
+    interval: str,
+    data_source: str = "auto",
+    openalgo_api_key: str | None = None,
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, str]:
+    days = max(7, min(int(days or 365), 730))
+    now = dt.datetime.now(dt.UTC)
+    start_ts = int((now - dt.timedelta(days=days + 60)).timestamp())
+    end_ts = int(now.timestamp())
+    sym = symbol.upper().strip()
+    ex = (exchange or "NSE").upper()
+    ds = (data_source or "auto").strip().lower()
+    req_interval = str(interval or "D")
+
+    if ds in {"broker", "broker_api", "auto"} and openalgo_api_key:
+        now_ist = dt.datetime.now(dt.UTC).astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30)))
+        end_date = now_ist.strftime("%Y-%m-%d")
+        start_date = (now_ist - dt.timedelta(days=days + 60)).strftime("%Y-%m-%d")
+        ok, payload, _status = get_history(
+            symbol=sym,
+            exchange=ex,
+            interval=req_interval,
+            start_date=start_date,
+            end_date=end_date,
+            api_key=openalgo_api_key,
+            source="api",
+        )
+        if ok:
+            raw = payload.get("data") if isinstance(payload, dict) else payload
+            if isinstance(raw, list) and raw:
+                df = pd.DataFrame(raw)
+                if not df.empty:
+                    c, h, l, o, v = _parse_ohlcv_df(df, req_interval, days)
+                    if len(c) >= 30:
+                        return c, h, l, o, v, "broker_api"
+        elif ds in {"broker", "broker_api"}:
+            raise RuntimeError(f"Broker OHLCV unavailable for {sym}:{ex} interval={req_interval}")
+
+    if ds in {"historify", "db", "auto"}:
+        df = get_ohlcv(sym, ex, req_interval, start_timestamp=start_ts, end_timestamp=end_ts)
+        if df is not None and len(df) >= 30:
+            c, h, l, o, v = _parse_ohlcv_df(df, req_interval, days)
+            return c, h, l, o, v, "historify"
+        if ds in {"historify", "db"}:
+            raise RuntimeError(f"Historify OHLCV unavailable for {sym}:{ex} interval={req_interval}")
+
+    if ds not in {"yahoo", "yahoo_finance", "auto"}:
+        raise RuntimeError(f"Requested data_source '{ds}' has no OHLCV for interval '{req_interval}'")
+
+    try:
+        import yfinance as yf
+
+        tick = _yahoo_ticker(sym, ex)
+        yf_interval = _YF_INTERVAL_MAP.get(req_interval, "1d")
+        if yf_interval == "1m":
+            period = f"{min(days + 2, 7)}d"
+        elif yf_interval in {"2m", "5m", "15m", "30m", "60m"}:
+            period = f"{min(days + 30, 60)}d"
+        else:
+            period = f"{min(days + 120, 729)}d"
+        hist = yf.download(
+            tick,
+            period=period,
+            interval=yf_interval,
+            progress=False,
+            auto_adjust=True,
+        )
+        if hist is None or hist.empty or len(hist) < 30:
+            raise RuntimeError(f"Insufficient Yahoo data for {tick} ({yf_interval})")
+
+        def _get_col(hs: pd.DataFrame, name: str) -> pd.Series:
+            col = hs[name]
+            return col.iloc[:, 0] if isinstance(col, pd.DataFrame) else col
+
+        close = _get_col(hist, "Close")
+        high = _get_col(hist, "High")
+        low = _get_col(hist, "Low")
+        open_ = _get_col(hist, "Open")
+        vol = _get_col(hist, "Volume") if "Volume" in hist.columns else pd.Series(0.0, index=hist.index)
+
+        idx = pd.to_datetime(close.index, utc=True, errors="coerce")
+        idx = idx.tz_convert("Asia/Kolkata")
+        if str(req_interval).lower() in {"d", "1d"}:
+            idx = idx.normalize()
+
+        c_s = pd.Series(close.values, index=idx, name="close")
+        h_s = pd.Series(high.values, index=idx, name="high")
+        l_s = pd.Series(low.values, index=idx, name="low")
+        o_s = pd.Series(open_.values, index=idx, name="open")
+        v_s = pd.Series(pd.to_numeric(vol, errors="coerce").fillna(0.0).values, index=idx, name="volume")
+        c_s = c_s[~c_s.index.duplicated(keep="last")].sort_index()
+        h_s = h_s.reindex(c_s.index).ffill().fillna(c_s)
+        l_s = l_s.reindex(c_s.index).ffill().fillna(c_s)
+        o_s = o_s.reindex(c_s.index).ffill().fillna(c_s)
+        v_s = v_s.reindex(c_s.index).fillna(0.0)
+
+        if str(req_interval).lower() in {"d", "1d"}:
+            tail = c_s.iloc[-days:]
+        else:
+            cutoff = c_s.index.max() - pd.Timedelta(days=max(2, int(days)))
+            tail = c_s.loc[c_s.index >= cutoff]
+            if tail.empty:
+                tail = c_s.iloc[-min(len(c_s), 500):]
+        return tail, h_s.loc[tail.index], l_s.loc[tail.index], o_s.loc[tail.index], v_s.loc[tail.index], "yahoo_finance"
+    except Exception as e:
+        logger.exception(f"No OHLCV for {sym} {ex} interval={req_interval}: {e}")
+        raise RuntimeError(
+            f"No historical OHLCV for {sym} on {ex} (interval={req_interval}). "
+            "Use OpenAlgo Historify / broker history, or pick a liquid symbol."
         ) from e
 
 
@@ -441,6 +653,23 @@ def _normalize_execution_days(raw: Iterable[int] | None) -> set[int] | None:
         return None
     out = {int(d) % 7 for d in raw}
     return out or None
+
+
+def _filter_entries_by_execution_days(
+    date_index: pd.DatetimeIndex,
+    entries: np.ndarray,
+    execution_days: list[int] | None,
+) -> np.ndarray:
+    allowed = _normalize_execution_days(execution_days)
+    if allowed is None:
+        return entries
+    out = entries.copy()
+    for i in range(len(out)):
+        if not out[i]:
+            continue
+        if not _execution_day_allowed(date_index, i, allowed):
+            out[i] = False
+    return out
 
 
 def _evaluate_entry_conditions_at_bar(
@@ -934,33 +1163,105 @@ def run_vectorbt_backtest(
             "Add `vectorbt` and `yfinance` to requirements and redeploy."
         ) from e
 
-    close, high, low, open_s, used_source = _load_ohlc(
-        symbol, exchange, days,
-        data_source=data_source,
-        openalgo_api_key=openalgo_api_key,
-    )
+    entry_conditions = entry_conditions or {}
+    exit_conditions = exit_conditions or {}
+    preset_id = extract_algo_guide_preset(entry_conditions)
+    selected_interval = PRESET_INTERVAL_MAP.get(preset_id, "D") if preset_id else "D"
+
+    extra_feeds: dict[str, dict[str, np.ndarray]] | None = None
+    if preset_id:
+        close, high, low, open_s, vol_s, used_source = _load_ohlcv_with_interval(
+            symbol,
+            exchange,
+            days,
+            selected_interval,
+            data_source=data_source,
+            openalgo_api_key=openalgo_api_key,
+        )
+        if preset_id == "smc_mtf_confluence":
+            c15, h15, l15, o15, v15, _ = _load_ohlcv_with_interval(
+                symbol,
+                exchange,
+                days,
+                "15m",
+                data_source=data_source,
+                openalgo_api_key=openalgo_api_key,
+            )
+            c1h, h1h, l1h, o1h, v1h, _ = _load_ohlcv_with_interval(
+                symbol,
+                exchange,
+                days,
+                "1h",
+                data_source=data_source,
+                openalgo_api_key=openalgo_api_key,
+            )
+            extra_feeds = {
+                "15m": {
+                    "t": (h15.index.view("int64") // 10**9).astype(float),
+                    "o": o15.astype(float).values,
+                    "h": h15.astype(float).values,
+                    "l": l15.astype(float).values,
+                    "c": c15.astype(float).values,
+                    "v": v15.astype(float).values,
+                },
+                "1h": {
+                    "t": (c1h.index.view("int64") // 10**9).astype(float),
+                    "o": o1h.astype(float).values,
+                    "h": h1h.astype(float).values,
+                    "l": l1h.astype(float).values,
+                    "c": c1h.astype(float).values,
+                    "v": v1h.astype(float).values,
+                },
+            }
+    else:
+        close, high, low, open_s, used_source = _load_ohlc(
+            symbol, exchange, days,
+            data_source=data_source,
+            openalgo_api_key=openalgo_api_key,
+        )
+        vol_s = pd.Series(np.zeros(len(close), dtype=float), index=close.index, name="volume")
+
     c = close.astype(float)
     h = high.astype(float).reindex(c.index).fillna(c)
     lo = low.astype(float).reindex(c.index).fillna(c)
     op = open_s.astype(float).reindex(c.index).fillna(c)
+    vol = vol_s.astype(float).reindex(c.index).fillna(0.0)
     closes = c.values
     highs = h.values
     lows = lo.values
     opens = op.values
+    volumes = vol.values
 
     sl = float(stop_loss_pct or 2)
     tp = float(take_profit_pct or 4)
     max_hold = int(max_hold_days or 10)
 
     # Decide which signal generator to use
+    use_preset = bool(preset_id)
     use_custom = bool(
-        entry_conditions
+        not use_preset
+        and entry_conditions
         and entry_conditions.get("groups")
         and len(entry_conditions["groups"]) > 0
         and entry_conditions.get("mode") != "raw"
     )
 
-    if use_custom:
+    if use_preset:
+        preset_params = get_preset_params(entry_conditions)
+        entries, exits, detailed_trades = run_preset_signals(
+            preset_id or "",
+            c.index,
+            opens,
+            highs,
+            lows,
+            closes,
+            volumes,
+            preset_params,
+            extra_feeds=extra_feeds,
+        )
+        entries = _filter_entries_by_execution_days(c.index, entries, execution_days)
+        used_strategy_label = preset_id or "preset"
+    elif use_custom:
         ec_out = exit_conditions or {}
         logger.info(
             f"Custom strategy '{custom_strategy_name or 'unnamed'}' "
@@ -989,10 +1290,11 @@ def run_vectorbt_backtest(
     price = pd.Series(closes, index=c.index)
     ent = pd.Series(entries, index=c.index)
     ex_s = pd.Series(exits, index=c.index)
+    freq = _INTERVAL_FREQ_MAP.get(selected_interval, "1D")
 
     pf = vbt.Portfolio.from_signals(
         price, entries=ent, exits=ex_s,
-        fees=0.0005, freq="1D", init_cash=100_000.0,
+        fees=0.0005, freq=freq, init_cash=100_000.0,
     )
 
     trades = pf.trades
@@ -1201,7 +1503,13 @@ def run_vectorbt_backtest(
 
     achieved: bool | Any = False
     reason_str = ""
-    if not use_custom:
+    if use_preset:
+        achieved = bool(np.any(entries[-20:])) if len(entries) > 0 else False
+        reason_str = (
+            f"Preset '{preset_id}' evaluated on {selected_interval} bars; "
+            f"{'recent entries present' if achieved else 'no recent entries'}."
+        )
+    elif not use_custom:
         if strategy == "trend_following" and action.upper() == "BUY":
             achieved = closes[last] > sma20_l and rsi_l > 45
             reason_str = (
@@ -1249,12 +1557,14 @@ def run_vectorbt_backtest(
     payload: dict[str, Any] = {
         "engine": "vectorbt",
         "action": action.upper(),
-        "backtestPeriod": f"{len(c)} daily bars",
-        "data_source": "market_data",
+        "backtestPeriod": f"{len(c)} {selected_interval} bars",
+        "data_source": used_source,
         "symbol": symbol.upper(),
         "exchange": (exchange or "NSE").upper(),
         "strategy": used_strategy_label,
         "usedCustomConditions": use_custom,
+        "usedPreset": preset_id,
+        "usedInterval": selected_interval,
         "executionDaysApplied": list(execution_days) if execution_days else None,
         # Core metrics
         "totalTrades": int(n_trades),
