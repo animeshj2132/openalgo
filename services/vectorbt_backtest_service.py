@@ -25,6 +25,7 @@ import pandas as pd
 
 from database.historify_db import get_ohlcv
 from services.history_service import get_history
+from services.option_symbol_service import construct_option_symbol
 from services.algo_guide_preset_backtest import (
     PRESET_INTERVAL_MAP,
     extract_algo_guide_preset,
@@ -1900,6 +1901,425 @@ def _simulate_orb_options_day(
     return results
 
 
+def _fetch_vix_daily_map(days: int) -> dict[str, float]:
+    """
+    Fetch India VIX daily closes keyed by YYYY-MM-DD (IST-ish calendar date).
+    Best effort only; returns {} if unavailable.
+    """
+    out: dict[str, float] = {}
+    try:
+        import yfinance as yf
+
+        lookback = max(30, min(int(days) + 30, 729))
+        hist = yf.download("^INDIAVIX", period=f"{lookback}d", interval="1d", progress=False, auto_adjust=True)
+        if hist is None or hist.empty:
+            return out
+        close_col = hist["Close"]
+        close_s = close_col.iloc[:, 0] if isinstance(close_col, pd.DataFrame) else close_col
+        for ts, v in close_s.items():
+            try:
+                vv = float(v)
+                if not math.isfinite(vv) or vv <= 0:
+                    continue
+                d = pd.Timestamp(ts).date().isoformat()
+                out[d] = vv
+            except Exception:
+                continue
+    except Exception:
+        return out
+    return out
+
+
+def _simulate_options_strategy_days(
+    strategy_type: str,
+    day_bars_map: dict[str, pd.DataFrame],
+    sorted_dates: list[str],
+    symbol: str,
+    expiry_type: str,
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Simulate non-ORB options strategies from real 5m underlying bars.
+    Returns ORB-compatible raw trade records.
+    """
+    out: list[dict[str, Any]] = []
+    vix_map = _fetch_vix_daily_map(max(60, len(sorted_dates)))
+    strike_step = 100 if "BANKNIFTY" in symbol.upper() else 50
+    tp_pct = float(params.get("profit_target_pct") or 50.0)
+    sl_mult = float(params.get("stop_loss_mult") or 2.0)
+    min_drop_pct = float(params.get("min_drop_pct") or 1.2)
+    min_vix = float(params.get("min_vix") or 13.0)
+    wing_width = float(params.get("wing_width_pts") or params.get("call_spread_width_pts") or 150.0)
+    min_credit_pct = float(params.get("min_credit_pct_of_width") or 0.40)
+
+    closes_daily: list[float] = []
+    ema20_vals: list[float] = []
+    ema50_vals: list[float] = []
+    rsi_vals: list[float] = []
+
+    for i, d in enumerate(sorted_dates):
+        df = day_bars_map.get(d)
+        if df is None or df.empty:
+            continue
+        day_open = float(df.iloc[0]["open"])
+        day_close = float(df.iloc[-1]["close"])
+        day_high = float(df["high"].max())
+        day_low = float(df["low"].min())
+        range_pct = ((day_high - day_low) / day_open * 100.0) if day_open > 0 else 0.0
+        day_move_pct = ((day_close - day_open) / day_open * 100.0) if day_open > 0 else 0.0
+        day_drop_pct = ((day_low - day_open) / day_open * 100.0) if day_open > 0 else 0.0
+        closes_daily.append(day_close)
+
+        # Lightweight EMA/RSI on daily closes
+        try:
+            e20 = pd.Series(closes_daily, dtype=float).ewm(span=20, adjust=False).mean().iloc[-1]
+            e50 = pd.Series(closes_daily, dtype=float).ewm(span=50, adjust=False).mean().iloc[-1]
+            ema20_vals.append(float(e20))
+            ema50_vals.append(float(e50))
+            rsi_arr = _rsi(np.asarray(closes_daily, dtype=float), 14)
+            rsi_now = float(rsi_arr[-1]) if len(rsi_arr) > 0 and not math.isnan(rsi_arr[-1]) else 50.0
+            rsi_vals.append(rsi_now)
+        except Exception:
+            ema20_vals.append(day_close)
+            ema50_vals.append(day_close)
+            rsi_vals.append(50.0)
+
+        dt_day = dt.date.fromisoformat(d)
+        dow = dt_day.weekday()  # Mon=0
+        vix = float(vix_map.get(d, float("nan")))
+        if not math.isfinite(vix):
+            vix = min_vix
+
+        # Find next expiry-like boundary for risk window
+        expiry_dow = _weekly_expiry_dow(symbol)  # Mon=0
+        end_i = min(i + 4, len(sorted_dates) - 1)
+        for j in range(i, len(sorted_dates)):
+            jd = dt.date.fromisoformat(sorted_dates[j])
+            if expiry_type == "weekly":
+                if jd.weekday() == expiry_dow:
+                    end_i = j
+                    break
+            else:
+                if jd.weekday() == expiry_dow and jd.day >= 22:
+                    end_i = j
+                    break
+        hi_until = -math.inf
+        lo_until = math.inf
+        for j in range(i, end_i + 1):
+            jf = day_bars_map.get(sorted_dates[j])
+            if jf is None or jf.empty:
+                continue
+            hi_until = max(hi_until, float(jf["high"].max()))
+            lo_until = min(lo_until, float(jf["low"].min()))
+        if not math.isfinite(hi_until) or not math.isfinite(lo_until):
+            continue
+
+        # Strategy-specific entries
+        if strategy_type == "iron_condor":
+            if dow != 0 or vix < min_vix:
+                continue
+            short_call = round((day_close * 1.015) / strike_step) * strike_step
+            short_put = round((day_close * 0.985) / strike_step) * strike_step
+            dte = max(1, end_i - i + 1)
+            net = max(float(params.get("min_net_premium") or 35.0), day_close * (vix / 100.0) * math.sqrt(dte / 365.0) * 0.30)
+            breach = max(max(0.0, hi_until - short_call), max(0.0, short_put - lo_until))
+            loss = min(breach, float(wing_width or 200.0))
+            pnl_pts = net - loss
+            pnl_pct = (pnl_pts / net) * 100.0 if net > 0 else 0.0
+            out.append({
+                "date": d, "direction": "CE", "entry_hhmm": "10:00", "exit_hhmm": "14:00",
+                "exit_reason": "TP" if pnl_pct >= tp_pct else ("SL" if pnl_pct <= -(sl_mult * 100.0) else "TIME"),
+                "pnl_pct": round(max(-(sl_mult * 100.0), min(100.0, pnl_pct)), 2),
+                "entry_price": day_close, "entry_premium": net,
+                "orb_high": short_call, "orb_low": short_put, "range_pct": round(range_pct, 2),
+                "short_call_strike": short_call,
+                "short_put_strike": short_put,
+                "long_call_strike": short_call + float(wing_width or 200.0),
+                "long_put_strike": short_put - float(wing_width or 200.0),
+            })
+            continue
+
+        if strategy_type == "strangle":
+            vix_3d = float(vix_map.get(sorted_dates[i - 3], vix)) if i >= 3 else vix
+            rise = ((vix - vix_3d) / vix_3d * 100.0) if vix_3d > 0 else 0.0
+            if vix < float(params.get("min_vix") or 18.0) or rise < 15.0:
+                continue
+            short_call = round((day_close * 1.02) / strike_step) * strike_step
+            short_put = round((day_close * 0.98) / strike_step) * strike_step
+            dte = max(1, end_i - i + 1)
+            net = max(float(params.get("min_net_premium") or 35.0), day_close * (vix / 100.0) * math.sqrt(dte / 365.0) * 0.35)
+            stress = max(max(0.0, hi_until - short_call), max(0.0, short_put - lo_until))
+            pnl_pts = net - stress
+            pnl_pct = (pnl_pts / net) * 100.0 if net > 0 else 0.0
+            out.append({
+                "date": d, "direction": "CE", "entry_hhmm": "11:00", "exit_hhmm": "15:15",
+                "exit_reason": "TP" if pnl_pct >= tp_pct else ("SL" if pnl_pct <= -(sl_mult * 100.0) else "TIME"),
+                "pnl_pct": round(max(-(sl_mult * 100.0), min(120.0, pnl_pct)), 2),
+                "entry_price": day_close, "entry_premium": net,
+                "orb_high": short_call, "orb_low": short_put, "range_pct": round(range_pct, 2),
+                "short_call_strike": short_call,
+                "short_put_strike": short_put,
+            })
+            continue
+
+        if strategy_type == "bull_put_spread":
+            near_support = (
+                abs(day_close - ema20_vals[-1]) / day_close < 0.008
+                or abs(day_close - ema50_vals[-1]) / day_close < 0.008
+            ) if day_close > 0 else False
+            if not (abs(day_drop_pct) >= min_drop_pct and day_drop_pct < 0 and rsi_vals[-1] < float(params.get("max_rsi") or 38.0) and near_support):
+                continue
+            width = float(wing_width or 100.0)
+            short_put = round((day_close * 0.995) / strike_step) * strike_step
+            long_put = short_put - width
+            net = max(width * min_credit_pct, width * 0.45)
+            min_low = lo_until
+            if min_low < long_put:
+                loss = width - net
+            elif min_low < short_put:
+                loss = max(0.0, short_put - min_low - net)
+            else:
+                loss = 0.0
+            pnl_pts = net - loss
+            pnl_pct = (pnl_pts / net) * 100.0 if net > 0 else 0.0
+            out.append({
+                "date": d, "direction": "PE", "entry_hhmm": "11:30", "exit_hhmm": "15:15",
+                "exit_reason": "TP" if pnl_pct >= tp_pct else ("SL" if pnl_pct <= -(sl_mult * 100.0) else "TIME"),
+                "pnl_pct": round(max(-(sl_mult * 100.0), min(100.0, pnl_pct)), 2),
+                "entry_price": day_close, "entry_premium": net,
+                "orb_high": short_put, "orb_low": long_put, "range_pct": round(range_pct, 2),
+                "short_put_strike": short_put,
+                "long_put_strike": long_put,
+            })
+            continue
+
+        if strategy_type == "jade_lizard":
+            bullish_bias = day_close >= ema20_vals[-1]
+            if not bullish_bias or vix < float(params.get("min_vix") or 15.0):
+                continue
+            width = float(wing_width or 150.0)
+            short_put = round((day_close * 0.988) / strike_step) * strike_step
+            short_call = round((day_close * 1.012) / strike_step) * strike_step
+            long_call = short_call + width
+            call_credit = width * 0.55
+            put_premium = width * 0.60
+            total_credit = call_credit + put_premium
+            if total_credit < width:
+                continue
+            down_breach = max(0.0, short_put - lo_until)
+            pnl_pts = total_credit - down_breach
+            pnl_pct = (pnl_pts / total_credit) * 100.0 if total_credit > 0 else 0.0
+            out.append({
+                "date": d, "direction": "PE", "entry_hhmm": "12:00", "exit_hhmm": "14:00",
+                "exit_reason": "TP" if pnl_pct >= tp_pct else ("SL" if pnl_pct <= -(sl_mult * 100.0) else "TIME"),
+                "pnl_pct": round(max(-(sl_mult * 100.0), min(100.0, pnl_pct)), 2),
+                "entry_price": day_close, "entry_premium": total_credit,
+                "orb_high": long_call, "orb_low": short_put, "range_pct": round(range_pct, 2),
+                "short_put_strike": short_put,
+                "short_call_strike": short_call,
+                "long_call_strike": long_call,
+            })
+
+    return out
+
+
+def _fmt_openalgo_expiry_from_date(d: dt.date) -> str:
+    return d.strftime("%d%b%y").upper()
+
+
+def _resolve_expiry_for_entry(entry_date: dt.date, underlying: str, expiry_type: str) -> dt.date:
+    dow = _weekly_expiry_dow(underlying)  # Mon=0
+    if expiry_type == "weekly":
+        days_ahead = (dow - entry_date.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        return entry_date + dt.timedelta(days=days_ahead)
+    # monthly: last target weekday of month
+    import calendar
+    year = entry_date.year
+    month = entry_date.month
+    last_day = calendar.monthrange(year, month)[1]
+    cand = dt.date(year, month, last_day)
+    while cand.weekday() != dow:
+        cand -= dt.timedelta(days=1)
+    if cand <= entry_date:
+        # next month
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+        last_day = calendar.monthrange(year, month)[1]
+        cand = dt.date(year, month, last_day)
+        while cand.weekday() != dow:
+            cand -= dt.timedelta(days=1)
+    return cand
+
+
+def _load_5m_bars_for_symbol(
+    symbol: str,
+    exchange: str,
+    start_date: str,
+    end_date: str,
+    openalgo_api_key: str,
+) -> pd.DataFrame:
+    ok, payload, _status = get_history(
+        symbol=symbol,
+        exchange=exchange,
+        interval="5m",
+        start_date=start_date,
+        end_date=end_date,
+        api_key=openalgo_api_key,
+        source="api",
+    )
+    if not ok:
+        return pd.DataFrame()
+    raw = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(raw, list) or not raw:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw)
+    if df.empty:
+        return df
+    df.columns = [str(c).lower() for c in df.columns]
+    if "timestamp" not in df.columns:
+        for alt in ("datetime", "date", "time"):
+            if alt in df.columns:
+                df.rename(columns={alt: "timestamp"}, inplace=True)
+                break
+    if "timestamp" not in df.columns:
+        return pd.DataFrame()
+    ts = df["timestamp"]
+    if pd.api.types.is_numeric_dtype(ts):
+        unit = "ms" if float(ts.max()) > 1e12 else "s"
+        df["dt"] = pd.to_datetime(ts, unit=unit, utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata")
+    else:
+        df["dt"] = pd.to_datetime(ts, utc=True, errors="coerce").dt.tz_convert("Asia/Kolkata")
+    df = df.dropna(subset=["dt"]).copy()
+    for c in ("open", "high", "low", "close"):
+        df[c] = pd.to_numeric(df.get(c, 0.0), errors="coerce").fillna(0.0)
+    df = df[df["close"] > 0].sort_values("dt").reset_index(drop=True)
+    return df
+
+
+def _price_at_or_after(df: pd.DataFrame, ts_ist: pd.Timestamp) -> float | None:
+    if df is None or df.empty:
+        return None
+    rows = df[df["dt"] >= ts_ist]
+    if rows.empty:
+        return None
+    return float(rows.iloc[0]["close"])
+
+
+def _price_at_or_before(df: pd.DataFrame, ts_ist: pd.Timestamp) -> float | None:
+    if df is None or df.empty:
+        return None
+    rows = df[df["dt"] <= ts_ist]
+    if rows.empty:
+        return None
+    return float(rows.iloc[-1]["close"])
+
+
+def _reprice_trade_from_leg_history(
+    trade: dict[str, Any],
+    strategy_type: str,
+    underlying: str,
+    options_exchange: str,
+    expiry_type: str,
+    openalgo_api_key: str,
+) -> float | None:
+    """
+    Return recalculated pnl_pct from actual option-leg premium series.
+    """
+    try:
+        entry_date = dt.date.fromisoformat(str(trade["date"]))
+    except Exception:
+        return None
+    expiry_dt = _resolve_expiry_for_entry(entry_date, underlying, expiry_type)
+    expiry_code = _fmt_openalgo_expiry_from_date(expiry_dt)
+
+    entry_hhmm = str(trade.get("entry_hhmm") or "10:00")
+    exit_hhmm = str(trade.get("exit_hhmm") or "15:15")
+    entry_ts = pd.Timestamp(f"{entry_date.isoformat()} {entry_hhmm}", tz="Asia/Kolkata")
+    exit_ts = pd.Timestamp(f"{entry_date.isoformat()} {exit_hhmm}", tz="Asia/Kolkata")
+    start_date = entry_date.isoformat()
+    end_date = max(entry_date, expiry_dt).isoformat()
+
+    def _sym(strike_key: str, opt: str) -> str | None:
+        s = trade.get(strike_key)
+        if s is None:
+            return None
+        try:
+            return construct_option_symbol(underlying.upper(), expiry_code, float(s), opt)
+        except Exception:
+            return None
+
+    legs: list[tuple[str, str]] = []  # (BUY/SELL, symbol)
+    if strategy_type == "iron_condor":
+        for act, k, ot in [
+            ("SELL", "short_call_strike", "CE"),
+            ("BUY", "long_call_strike", "CE"),
+            ("SELL", "short_put_strike", "PE"),
+            ("BUY", "long_put_strike", "PE"),
+        ]:
+            sym = _sym(k, ot)
+            if sym:
+                legs.append((act, sym))
+    elif strategy_type == "strangle":
+        for act, k, ot in [
+            ("SELL", "short_call_strike", "CE"),
+            ("SELL", "short_put_strike", "PE"),
+        ]:
+            sym = _sym(k, ot)
+            if sym:
+                legs.append((act, sym))
+    elif strategy_type == "bull_put_spread":
+        for act, k, ot in [
+            ("SELL", "short_put_strike", "PE"),
+            ("BUY", "long_put_strike", "PE"),
+        ]:
+            sym = _sym(k, ot)
+            if sym:
+                legs.append((act, sym))
+    elif strategy_type == "jade_lizard":
+        for act, k, ot in [
+            ("SELL", "short_put_strike", "PE"),
+            ("SELL", "short_call_strike", "CE"),
+            ("BUY", "long_call_strike", "CE"),
+        ]:
+            sym = _sym(k, ot)
+            if sym:
+                legs.append((act, sym))
+    else:
+        return None
+
+    if not legs:
+        return None
+
+    entry_credit = 0.0
+    exit_value = 0.0
+    resolved = 0
+    for action, sym in legs:
+        df_leg = _load_5m_bars_for_symbol(sym, options_exchange, start_date, end_date, openalgo_api_key)
+        if df_leg.empty:
+            continue
+        ep = _price_at_or_after(df_leg, entry_ts)
+        xp = _price_at_or_before(df_leg, exit_ts if expiry_dt == entry_date else pd.Timestamp(f"{expiry_dt.isoformat()} 15:15", tz="Asia/Kolkata"))
+        if ep is None or xp is None or ep <= 0:
+            continue
+        resolved += 1
+        if action == "SELL":
+            entry_credit += ep
+            exit_value += xp
+        else:
+            entry_credit -= ep
+            exit_value -= xp
+
+    if resolved == 0 or abs(entry_credit) < 1e-9:
+        return None
+    pnl_pct = ((entry_credit - exit_value) / abs(entry_credit)) * 100.0
+    return float(round(pnl_pct, 2))
+
+
 def run_options_orb_backtest(
     symbol: str,
     exchange: str,
@@ -2255,6 +2675,170 @@ def run_options_orb_backtest(
         "historicalSnapshots": historical_snapshots,
         "strategyAchieved": False,
         "achievementReason": "Options ORB backtest — live check not applicable.",
+        "currentIndicators": {},
+    }
+    return _json_sanitize(payload)
+
+
+def run_options_strategy_backtest(
+    strategy_type: str,
+    symbol: str,
+    exchange: str,
+    days: int = 90,
+    openalgo_api_key: str | None = None,
+    options_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Generic options strategy backtest on broker 5m underlying bars.
+    Supported: options_orb, iron_condor, strangle, bull_put_spread, jade_lizard.
+    """
+    st = (strategy_type or "").strip().lower()
+    cfg = options_config or {}
+    if st == "options_orb":
+        return run_options_orb_backtest(
+            symbol=symbol,
+            exchange=exchange,
+            days=days,
+            openalgo_api_key=openalgo_api_key,
+            orb_duration_mins=int(cfg.get("orb_duration_mins") or 15),
+            min_range_pct=float(cfg.get("min_range_pct") or 0.2),
+            max_range_pct=float(cfg.get("max_range_pct") or 1.0),
+            momentum_bars=int(cfg.get("momentum_bars") or 3),
+            trade_direction=str(cfg.get("trade_direction") or "neutral"),
+            expiry_type=str(cfg.get("expiry_type") or "weekly"),
+            expiry_day_guard=bool(cfg.get("expiry_day_guard", True)),
+            sl_pct=float(cfg.get("sl_pct") or 30.0),
+            tp_pct=float(cfg.get("tp_pct") or 50.0),
+            trailing_enabled=bool(cfg.get("trailing_enabled", True)),
+            trail_after_pct=float(cfg.get("trail_after_pct") or 30.0),
+            trail_pct=float(cfg.get("trail_pct") or 15.0),
+            time_exit_hhmm=str(cfg.get("time_exit_hhmm") or "15:15"),
+            max_reentry_count=int(cfg.get("max_reentry_count") or 1),
+            lot_size=int(cfg.get("lot_size") or 1),
+            max_premium_per_lot=float(cfg.get("max_premium_per_lot") or 500.0),
+            options_symbol=str(cfg.get("options_symbol") or ""),
+            expiry_date=str(cfg.get("expiry_date") or ""),
+        )
+
+    if st not in {"iron_condor", "strangle", "bull_put_spread", "jade_lizard"}:
+        raise RuntimeError(f"Unsupported options strategy for backtest: {strategy_type}")
+    if not openalgo_api_key:
+        raise RuntimeError("OpenAlgo API key required for options strategy backtest.")
+
+    days = max(10, min(int(days), 365))
+    sym = symbol.strip().upper()
+    ex = (exchange or "NSE").strip().upper()
+    if sym in {"NIFTY", "NIFTY50", "NIFTY 50", "BANKNIFTY", "BANK NIFTY", "FINNIFTY", "FIN NIFTY", "MIDCPNIFTY", "MIDCAP NIFTY", "NIFTYNXT50"} and ex in ("NSE", "NFO"):
+        ex = "NSE_INDEX"
+    if sym in {"SENSEX", "BANKEX"} and ex in ("BSE", "BFO"):
+        ex = "BSE_INDEX"
+
+    df = _load_5m_bars_for_underlying(sym, ex, days, openalgo_api_key)
+    if df.empty:
+        raise RuntimeError(f"No 5-min bars returned for {sym}.")
+    df["date_key"] = df["dt"].apply(lambda t: str(t.date()))
+    day_map: dict[str, pd.DataFrame] = {k: g.sort_values("dt").reset_index(drop=True) for k, g in df.groupby("date_key")}
+    sorted_dates = sorted(day_map.keys())
+
+    raw_trades = _simulate_options_strategy_days(
+        strategy_type=st,
+        day_bars_map=day_map,
+        sorted_dates=sorted_dates,
+        symbol=sym,
+        expiry_type=str(cfg.get("expiry_type") or "weekly"),
+        params=cfg,
+    )
+
+    # Reprice synthetic raw trades with real option-leg premium history when possible.
+    options_ex = "BFO" if ex.startswith("BSE") else "NFO"
+    expiry_type_cfg = str(cfg.get("expiry_type") or "weekly")
+    for t in raw_trades:
+        try:
+            rp = _reprice_trade_from_leg_history(
+                trade=t,
+                strategy_type=st,
+                underlying=sym,
+                options_exchange=options_ex,
+                expiry_type=expiry_type_cfg,
+                openalgo_api_key=openalgo_api_key or "",
+            )
+            if rp is not None and math.isfinite(rp):
+                t["pnl_pct"] = float(rp)
+                if float(t.get("entry_price") or 0) > 0:
+                    # Approximate entry premium from strike structure when repriced
+                    t["entry_premium"] = abs(float(t.get("entry_premium") or 0.0))
+        except Exception:
+            continue
+
+    # compact aggregation (compatible keys)
+    lot_size = int(cfg.get("lot_size") or 1)
+    lot_units_map = {"NIFTY": 75, "BANKNIFTY": 15, "FINNIFTY": 40, "MIDCPNIFTY": 50, "NIFTYNXT50": 25, "SENSEX": 10, "BANKEX": 15}
+    lot_units = lot_units_map.get(sym, 75)
+    trades: list[dict[str, Any]] = []
+    for i, t in enumerate(raw_trades):
+        ep = float(t.get("entry_premium") or (float(t.get("entry_price") or 0.0) * 0.008))
+        xp = ep * (1 + float(t["pnl_pct"]) / 100.0)
+        abs_pnl = round((xp - ep) * lot_units * lot_size, 2)
+        trades.append({
+            "tradeNo": i + 1,
+            "entryDate": t["date"], "exitDate": t["date"],
+            "entryTime": t.get("entry_hhmm", ""), "exitTime": t.get("exit_hhmm", ""),
+            "entryPrice": round(ep, 2), "exitPrice": round(xp, 2), "holdingDays": 0.2,
+            "returnPct": round(float(t["pnl_pct"]), 2), "absPnl": abs_pnl,
+            "profitable": float(t["pnl_pct"]) > 0, "exitReason": str(t.get("exit_reason", "time")).lower(),
+            "entryRsi": None, "entrySma20": None, "entryMacd": None, "exitRsi": None, "candles": [],
+            "direction": t.get("direction", "CE"), "entry_hhmm": t.get("entry_hhmm", ""), "exit_hhmm": t.get("exit_hhmm", ""),
+            "orb_high": round(float(t.get("orb_high", 0.0)), 2), "orb_low": round(float(t.get("orb_low", 0.0)), 2),
+            "range_pct": round(float(t.get("range_pct", 0.0)), 2), "underlying_entry": round(float(t.get("entry_price", 0.0)), 2),
+        })
+
+    rets = [float(t["returnPct"]) for t in trades]
+    n_trades = len(trades)
+    wins = sum(1 for r in rets if r > 0)
+    losses = n_trades - wins
+    wr = (wins / n_trades * 100.0) if n_trades else 0.0
+    avg_win = round(sum(r for r in rets if r > 0) / max(1, sum(1 for r in rets if r > 0)), 2) if rets else 0.0
+    avg_loss = round(sum(r for r in rets if r <= 0) / max(1, sum(1 for r in rets if r <= 0)), 2) if rets else 0.0
+    expectancy = round((wr / 100.0) * avg_win + (1 - wr / 100.0) * avg_loss, 2) if rets else 0.0
+    equity_curve: list[dict[str, Any]] = []
+    cum = 0.0
+    for t in trades:
+        cum += float(t["returnPct"])
+        equity_curve.append({"date": t["entryDate"], "value": round(cum, 2)})
+
+    payload: dict[str, Any] = {
+        "engine": f"options_{st}",
+        "action": "BUY",
+        "backtestPeriod": f"{len(sorted_dates)} trading days ({days}d lookback)",
+        "data_source": "broker_5m_bars",
+        "symbol": sym,
+        "exchange": ex,
+        "strategy": st,
+        "usedCustomConditions": False,
+        "isOptionsBacktest": True,
+        "optionsConfig": cfg,
+        "totalTrades": n_trades, "wins": wins, "losses": losses, "winRate": round(wr, 2),
+        "totalReturn": round(sum(rets), 2), "totalAbsPnl": round(sum(float(t["absPnl"]) for t in trades), 2) if trades else 0.0,
+        "avgReturn": round(sum(rets) / n_trades, 4) if n_trades else 0.0,
+        "maxDrawdown": round(max(0.0, max((max(equity_curve[:i + 1], key=lambda x: x["value"])["value"] - equity_curve[i]["value"]) for i in range(len(equity_curve))) if equity_curve else 0.0), 2),
+        "profitFactor": round((sum(r for r in rets if r > 0) / abs(sum(r for r in rets if r <= 0))), 2) if sum(r for r in rets if r <= 0) < 0 else 0.0,
+        "sharpeRatio": 0.0,
+        "bestTrade": round(max(rets), 2) if rets else 0.0,
+        "worstTrade": round(min(rets), 2) if rets else 0.0,
+        "avgHoldingDays": 0.2,
+        "avgWin": avg_win,
+        "avgLoss": avg_loss,
+        "expectancy": expectancy,
+        "maxWinStreak": 0,
+        "maxLossStreak": 0,
+        "exitReasonCounts": {},
+        "sampleTrades": trades[:8],
+        "trades": trades,
+        "equityCurve": equity_curve,
+        "dailyReturns": [],
+        "historicalSnapshots": [],
+        "strategyAchieved": False,
+        "achievementReason": f"{st} options backtest completed.",
         "currentIndicators": {},
     }
     return _json_sanitize(payload)
